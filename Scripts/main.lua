@@ -1,4 +1,4 @@
--- WeaponProgression v0.13.0 - Native weapon level-up notifications
+-- WeaponProgression v0.14.0-dev3 - Populated live-slot selection experiment
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Notification discovery build based on the proven v0.12.4 persistent progression core.
@@ -48,9 +48,12 @@
 --   v0.12.9 - Keep verify debounce; synchronous native-toast passthrough using the live vanilla FText wrapper only.
 --   v0.12.10 - KismetTextLibrary safely creates custom FText; native custom toast visually confirmed.
 --   v0.13.0 - Production native weapon level-up notifications; notification probe hooks removed.
+--   v0.14.0-dev - Validate and reuse cached live JSI weapon slots before falling back to a full scan.
+--   v0.14.0-dev3 - Prefer GUID-matching JSI slots with populated firearm ItemStats; reject zero-stat duplicate/stub slots.
+--   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.13.0 NATIVE LEVEL-UP NOTIFICATIONS"
+local VERSION = "0.14.0-dev3 POPULATED SLOT SELECTION"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -60,6 +63,8 @@ local PATH_ADD_XP =
     "/Game/Blueprints/Components/LevellingComponent.LevellingComponent_C:AddXP"
 local PATH_DEATH =
     "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C:Death"
+local PATH_JIG_TRY_ADD =
+    "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:JigTryAddItemSomewhere"
 
 local JIG_COMPONENT_CLASS = "BP_JigComponent_C"
 
@@ -583,6 +588,20 @@ end
 
 local JSI_SLOT_CLASS = "JSI_Slot_C"
 
+-- v0.14.0-dev cache instrumentation. The full v0.13.0 JSI scanner remains the
+-- authoritative fallback. Cache entries are accepted only after the cached
+-- UObject reports IsValid(), its current ItemUniqueID decodes to the expected
+-- physical weapon GUID, and its live ItemStats can still be read.
+local cacheCounters = { hits=0, misses=0, invalid=0, fallbacks=0, lifecycle_resets=0 }
+
+local function cache_log(event, uid, weaponName, detail)
+    log(string.format(
+        "LIVE CACHE %s | %s | %s | %s | totals hit=%d miss=%d invalid=%d fallback=%d lifecycle_reset=%d",
+        tostring(event), tostring(weaponName), tostring(uid), tostring(detail or ""),
+        cacheCounters.hits, cacheCounters.misses, cacheCounters.invalid, cacheCounters.fallbacks, cacheCounters.lifecycle_resets
+    ))
+end
+
 local function read_live_stat_map(slot)
     local okStats, statsArr = pcall(function() return slot["ItemStats"] end)
     if not okStats or statsArr == nil then return nil, "ItemStats unreadable" end
@@ -652,6 +671,91 @@ local function capture_base_stats(uid, weaponName, statMap)
     end
 end
 
+local function try_cached_live_weapon(reason, targetUid, targetWeapon, targetUidStruct)
+    local cached = liveWeapons[targetUid]
+    if cached == nil or cached.slot == nil then
+        cacheCounters.misses = cacheCounters.misses + 1
+        cache_log("MISS", targetUid, targetWeapon, "no cached slot")
+        return false
+    end
+
+    local slot = cached.slot
+    local okValid, isValid = pcall(function() return slot:IsValid() end)
+    if not okValid or not isValid then
+        cacheCounters.invalid = cacheCounters.invalid + 1
+        liveWeapons[targetUid] = nil
+        cache_log("INVALID", targetUid, targetWeapon, "cached UObject failed IsValid")
+        return false
+    end
+
+    -- Re-read the UID from the live slot every time. Do not trust a previously
+    -- retained struct wrapper when deciding whether this cache entry is safe.
+    local okUidField, slotUidStruct = pcall(function()
+        return slot[FIELDS.item_unique_id]
+    end)
+    if not okUidField or slotUidStruct == nil then
+        cacheCounters.invalid = cacheCounters.invalid + 1
+        liveWeapons[targetUid] = nil
+        cache_log("INVALID", targetUid, targetWeapon, "ItemUniqueID unreadable")
+        return false
+    end
+
+    local slotUid = nil
+    local okGuid = pcall(function() slotUid = guid_to_string(slotUidStruct) end)
+    if not okGuid or slotUid ~= targetUid then
+        cacheCounters.invalid = cacheCounters.invalid + 1
+        liveWeapons[targetUid] = nil
+        cache_log("INVALID", targetUid, targetWeapon,
+            "GUID mismatch live=" .. tostring(slotUid))
+        return false
+    end
+
+    local statMap, statErr = read_live_stat_map(slot)
+    if statMap == nil then
+        cacheCounters.invalid = cacheCounters.invalid + 1
+        liveWeapons[targetUid] = nil
+        cache_log("INVALID", targetUid, targetWeapon,
+            "live stats unreadable: " .. tostring(statErr))
+        return false
+    end
+
+    local cachedStatCount = 0
+    for _ in pairs(statMap) do cachedStatCount = cachedStatCount + 1 end
+    if cachedStatCount == 0 then
+        cacheCounters.invalid = cacheCounters.invalid + 1
+        liveWeapons[targetUid] = nil
+        cache_log("INVALID", targetUid, targetWeapon,
+            "cached GUID still matches but ItemStats=0; forcing populated-slot rescan")
+        return false
+    end
+
+    local jig = resolve_player_jig_direct(reason)
+    liveWeapons[targetUid] = {
+        weapon=targetWeapon,
+        uidStruct=slotUidStruct,
+        equipmentUidStruct=targetUidStruct,
+        slotUidStruct=slotUidStruct,
+        jig=jig,
+        slot=slot,
+        stats=statMap,
+    }
+
+    capture_base_stats(targetUid, targetWeapon, statMap)
+
+    -- Match v0.13.0 real-resolution behaviour exactly. Verification scans are
+    -- intentionally left on the independent full-scan path in this dev build.
+    if process_pending_rewards ~= nil then
+        process_pending_rewards(targetUid, targetWeapon)
+    end
+    if reconcile_weapon_stats ~= nil then
+        reconcile_weapon_stats(targetUid, targetWeapon, "resolve")
+    end
+
+    cacheCounters.hits = cacheCounters.hits + 1
+    cache_log("HIT", targetUid, targetWeapon, "validated populated slot reused | ItemStats=" .. tostring(cachedStatCount))
+    return true
+end
+
 scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
     local okFindAll, slotsOrErr = pcall(function() return FindAllOf(JSI_SLOT_CLASS) end)
     if not okFindAll or slotsOrErr == nil then
@@ -665,6 +769,12 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
     log("JSI SCAN | reason=" .. tostring(reason) .. " | candidates=" .. tostring(count))
     if not count or count == 0 then return false end
 
+    -- v0.14.0-dev3: a physical GUID can exist on multiple live JSI_Slot_C
+    -- objects. dev2 proved that the highest-index duplicate may be a zero-stat
+    -- stub. Collect every readable GUID match, measure its decoded firearm stat
+    -- count, and prefer populated candidates. Never assume scan order implies
+    -- authority.
+    local matches = {}
     for i = 1, count do
         local okSlot, slot = pcall(function() return slots[i] end)
         if okSlot and slot ~= nil then
@@ -672,98 +782,162 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
             if okUidField and slotUidStruct ~= nil then
                 local slotUid = nil
                 pcall(function() slotUid = guid_to_string(slotUidStruct) end)
-
                 if targetUid ~= nil and slotUid == targetUid then
-                    log("JSI MATCH | index=" .. tostring(i) .. " | uid=" .. tostring(slotUid) .. " | reason=" .. tostring(reason))
-
                     local statMap, statErr = read_live_stat_map(slot)
-                    if statMap == nil then
-                        log("JSI MATCH | exact firearm slot found but " .. tostring(statErr))
-                        return true
-                    end
-
-                    local statCount = 0
-                    for _ in pairs(statMap) do statCount = statCount + 1 end
-                    log("JSI MATCH | exact firearm slot ItemStats=" .. tostring(statCount))
-                    log("MUTATION UID | using live JSI_Slot_C.ItemUniqueID wrapper for UpdateStatByUID")
-
-                    for _, def in ipairs(STAT_DEFS) do
-                        local live = statMap[def.tag]
-                        if live then
-                            log(string.format("JSI MATCH STAT | index=%d | tag=%s | value=%.6g", live.index, def.tag, live.value))
-                        end
-                    end
-
-                    local jig = resolve_player_jig_direct(reason)
-                    liveWeapons[targetUid] = {
-                        weapon=targetWeapon,
-                        uidStruct=slotUidStruct,
-                        equipmentUidStruct=targetUidStruct,
-                        slotUidStruct=slotUidStruct,
-                        jig=jig,
-                        slot=slot,
-                        stats=statMap,
-                    }
-
-                    capture_base_stats(targetUid, targetWeapon, statMap)
-
-                    -- IMPORTANT: Verify scans are read-only. v0.12.0 allowed a delayed
-                    -- verification scan to reconcile again. If the live JSI view still
-                    -- showed the pre-write value, that reconciliation scheduled another
-                    -- Verify scan, creating an endless apply -> verify -> apply loop.
-                    -- Only genuine weapon-resolution scans may process/reapply upgrades.
-                    local reasonText = tostring(reason or "")
-                    local isVerifyScan = reasonText:sub(1, 7) == "Verify:"
-                    if isVerifyScan then
-                        local r = records[targetUid]
-                        local mismatches = 0
-                        if r ~= nil then
-                            r.bases = r.bases or {}
-                            r.upgrades = r.upgrades or {}
-                            for _, def in ipairs(STAT_DEFS) do
-                                local base = r.bases[def.key]
-                                local count = r.upgrades[def.key] or 0
-                                local liveStat = statMap[def.tag]
-                                if base ~= nil and count > 0 and liveStat ~= nil then
-                                    local target
-                                    if def.mode == "percent" then
-                                        target = base * ((1.0 + (Config[def.config] / 100.0)) ^ math.max(0, math.floor(tonumber(count) or 0)))
-                                    else
-                                        target = base + (Config[def.config] * math.max(0, math.floor(tonumber(count) or 0)))
-                                    end
-                                    local tolerance = math.max(0.0001, math.abs(target) * 0.000001)
-                                    if math.abs(liveStat.value - target) <= tolerance then
-                                        log(string.format("STAT VERIFY OK | %s | %s | %s | live=%.6g | target=%.6g", targetWeapon,targetUid,def.tag,liveStat.value,target))
-                                    else
-                                        mismatches = mismatches + 1
-                                        log(string.format("STAT VERIFY MISMATCH | %s | %s | %s | live=%.6g | target=%.6g | no_retry_until_next_real_resolution", targetWeapon,targetUid,def.tag,liveStat.value,target))
-                                    end
-                                end
-                            end
-                        end
-                        if mismatches == 0 then
-                            log("STAT VERIFY COMPLETE | " .. tostring(targetWeapon) .. " | no mismatches")
-                        else
-                            log("STAT VERIFY COMPLETE | " .. tostring(targetWeapon) .. " | mismatches=" .. tostring(mismatches) .. " | recursive retry suppressed")
-                        end
+                    if statMap ~= nil then
+                        local statCount = 0
+                        for _ in pairs(statMap) do statCount = statCount + 1 end
+                        table.insert(matches, {
+                            index=i,
+                            slot=slot,
+                            uidStruct=slotUidStruct,
+                            statMap=statMap,
+                            statCount=statCount,
+                        })
+                        log("JSI MATCH CANDIDATE | index=" .. tostring(i) ..
+                            " | uid=" .. tostring(slotUid) ..
+                            " | ItemStats=" .. tostring(statCount) ..
+                            " | quality=" .. (statCount > 0 and "POPULATED" or "EMPTY"))
                     else
-                        if process_pending_rewards ~= nil then
-                            process_pending_rewards(targetUid, targetWeapon)
-                        end
-                        if reconcile_weapon_stats ~= nil then
-                            reconcile_weapon_stats(targetUid, targetWeapon, "resolve")
-                        end
+                        log("JSI MATCH CANDIDATE | index=" .. tostring(i) ..
+                            " | uid=" .. tostring(slotUid) ..
+                            " | rejected=" .. tostring(statErr))
                     end
-
-                    log("JSI MATCH COMPLETE | exact firearm live slot located | weapon=" .. tostring(targetWeapon) .. " | reason=" .. tostring(reason))
-                    return true
                 end
             end
         end
     end
 
-    log("JSI SCAN COMPLETE | reason=" .. tostring(reason) .. " | matches=0")
-    return false
+    if #matches == 0 then
+        log("JSI SCAN COMPLETE | reason=" .. tostring(reason) .. " | matches=0")
+        return false
+    end
+
+    local populated = {}
+    for _, m in ipairs(matches) do
+        if (m.statCount or 0) > 0 then populated[#populated+1] = m end
+    end
+
+    if #populated == 0 then
+        local idx = {}
+        for _, m in ipairs(matches) do idx[#idx+1] = tostring(m.index) .. ":0" end
+        log("JSI MATCH REJECTED | uid=" .. tostring(targetUid) ..
+            " | all GUID matches have zero decoded firearm stats" ..
+            " | candidates=" .. table.concat(idx, ",") ..
+            " | reason=" .. tostring(reason))
+        return false
+    end
+
+    -- If several populated representations exist, do not pretend scan order
+    -- proves which is authoritative. For this dev build choose the candidate
+    -- with the richest decoded firearm stat set; ties deliberately choose the
+    -- earliest index because that matches the known-good pre-drop representation
+    -- observed in our current test set. Ambiguity remains loudly logged.
+    local chosen = populated[1]
+    for n = 2, #populated do
+        local m = populated[n]
+        if (m.statCount or 0) > (chosen.statCount or 0) then
+            chosen = m
+        end
+    end
+
+    if #matches > 1 then
+        local desc = {}
+        for _, m in ipairs(matches) do
+            desc[#desc+1] = tostring(m.index) .. ":" .. tostring(m.statCount or 0)
+        end
+        log("JSI MULTI MATCH | uid=" .. tostring(targetUid) ..
+            " | count=" .. tostring(#matches) ..
+            " | candidates=index:stats[" .. table.concat(desc, ",") .. "]" ..
+            " | populated=" .. tostring(#populated) ..
+            " | selected_index=" .. tostring(chosen.index) ..
+            " | selected_stats=" .. tostring(chosen.statCount or 0) ..
+            " | policy=richest_populated_then_earliest_tie" ..
+            " | reason=" .. tostring(reason))
+        if #populated > 1 then
+            log("JSI POPULATED AMBIGUITY | uid=" .. tostring(targetUid) ..
+                " | populated_candidates=" .. tostring(#populated) ..
+                " | selected_index=" .. tostring(chosen.index) ..
+                " | reason=" .. tostring(reason))
+        end
+    end
+
+    local slot = chosen.slot
+    local slotUidStruct = chosen.uidStruct
+    local statMap = chosen.statMap
+
+    log("JSI MATCH | index=" .. tostring(chosen.index) .. " | uid=" .. tostring(targetUid) .. " | reason=" .. tostring(reason))
+
+    local statCount = 0
+    for _ in pairs(statMap) do statCount = statCount + 1 end
+    log("JSI MATCH | exact firearm slot ItemStats=" .. tostring(statCount))
+    log("MUTATION UID | using selected live JSI_Slot_C.ItemUniqueID wrapper for UpdateStatByUID")
+
+    for _, def in ipairs(STAT_DEFS) do
+        local live = statMap[def.tag]
+        if live then
+            log(string.format("JSI MATCH STAT | index=%d | tag=%s | value=%.6g", live.index, def.tag, live.value))
+        end
+    end
+
+    local jig = resolve_player_jig_direct(reason)
+    liveWeapons[targetUid] = {
+        weapon=targetWeapon,
+        uidStruct=slotUidStruct,
+        equipmentUidStruct=targetUidStruct,
+        slotUidStruct=slotUidStruct,
+        jig=jig,
+        slot=slot,
+        stats=statMap,
+    }
+
+    capture_base_stats(targetUid, targetWeapon, statMap)
+
+    local reasonText = tostring(reason or "")
+    local isVerifyScan = reasonText:sub(1, 7) == "Verify:"
+    if isVerifyScan then
+        local r = records[targetUid]
+        local mismatches = 0
+        if r ~= nil then
+            r.bases = r.bases or {}
+            r.upgrades = r.upgrades or {}
+            for _, def in ipairs(STAT_DEFS) do
+                local base = r.bases[def.key]
+                local upgradeCount = r.upgrades[def.key] or 0
+                local liveStat = statMap[def.tag]
+                if base ~= nil and upgradeCount > 0 and liveStat ~= nil then
+                    local target
+                    if def.mode == "percent" then
+                        target = base * ((1.0 + (Config[def.config] / 100.0)) ^ math.max(0, math.floor(tonumber(upgradeCount) or 0)))
+                    else
+                        target = base + (Config[def.config] * math.max(0, math.floor(tonumber(upgradeCount) or 0)))
+                    end
+                    local tolerance = math.max(0.0001, math.abs(target) * 0.000001)
+                    if math.abs(liveStat.value - target) <= tolerance then
+                        log(string.format("STAT VERIFY OK | %s | %s | %s | live=%.6g | target=%.6g", targetWeapon,targetUid,def.tag,liveStat.value,target))
+                    else
+                        mismatches = mismatches + 1
+                        log(string.format("STAT VERIFY MISMATCH | %s | %s | %s | live=%.6g | target=%.6g | no_retry_until_next_real_resolution", targetWeapon,targetUid,def.tag,liveStat.value,target))
+                    end
+                end
+            end
+        end
+        if mismatches == 0 then
+            log("STAT VERIFY COMPLETE | " .. tostring(targetWeapon) .. " | no mismatches")
+        else
+            log("STAT VERIFY COMPLETE | " .. tostring(targetWeapon) .. " | mismatches=" .. tostring(mismatches) .. " | recursive retry suppressed")
+        end
+    else
+        if process_pending_rewards ~= nil then
+            process_pending_rewards(targetUid, targetWeapon)
+        end
+        if reconcile_weapon_stats ~= nil then
+            reconcile_weapon_stats(targetUid, targetWeapon, "resolve")
+        end
+    end
+
+    log("JSI MATCH COMPLETE | exact firearm live slot located | weapon=" .. tostring(targetWeapon) .. " | reason=" .. tostring(reason))
+    return true
 end
 
 local function probe_active_firearm_slot(uidStruct, uid, weaponName)
@@ -772,13 +946,20 @@ local function probe_active_firearm_slot(uidStruct, uid, weaponName)
         return
     end
 
-    local jig = resolve_player_jig_direct("Firearm:" .. tostring(weaponName))
+    local reason = "Firearm:" .. tostring(weaponName)
+    local jig = resolve_player_jig_direct(reason)
     log("FIREARM LIVE STAT | weapon=" .. tostring(weaponName) ..
         " | equipment_uid=" .. tostring(uid) ..
         " | direct_player_jig=" .. (jig ~= nil and "RESOLVED" or "NOT_RESOLVED") ..
-        " | scanning live JSI_Slot_C objects.")
+        " | cache-first resolution.")
 
-    scan_live_jsi_slots("Firearm:" .. tostring(weaponName), uid, weaponName, uidStruct)
+    if try_cached_live_weapon(reason, uid, weaponName, uidStruct) then
+        return
+    end
+
+    cacheCounters.fallbacks = cacheCounters.fallbacks + 1
+    cache_log("FALLBACK", uid, weaponName, "running proven full JSI scan")
+    scan_live_jsi_slots(reason, uid, weaponName, uidStruct)
 end
 
 -- ============================================================================
@@ -1405,8 +1586,29 @@ local function on_server_damage(Context, Headshot, DamagedActor, ImpactPoint, ..
     end
 end
 
+local function on_inventory_add_cache_invalidate(Context, LocalCompParam, ItemIdParam, CountParam, AddedParam, UIDParam, ...)
+    -- v0.14.0-dev2: a dropped/re-picked item can retain the same physical GUID
+    -- while SurrounDead creates/rebinds JSI slot state. The old UObject may remain
+    -- IsValid(), so GUID + IsValid alone is insufficient. Clear any known cache
+    -- entry when this inventory-add path reports that GUID; next damage performs
+    -- one authoritative full reacquisition.
+    local uid = nil
+    pcall(function()
+        local uidStruct = UIDParam:get()
+        uid = guid_to_string(uidStruct)
+    end)
+
+    if uid ~= nil and liveWeapons[uid] ~= nil then
+        local weaponName = liveWeapons[uid].weapon or (records[uid] and records[uid].weapon) or "Unknown"
+        liveWeapons[uid] = nil
+        cacheCounters.lifecycle_resets = cacheCounters.lifecycle_resets + 1
+        cache_log("RESET", uid, weaponName, "JigTryAddItemSomewhere observed same physical GUID")
+    end
+end
+
 local hooks = {
     {"GET_EQUIPMENT_UID", PATH_GET_EQUIPMENT_UID, on_get_equipment_uid},
+    {"JIG_TRY_ADD",       PATH_JIG_TRY_ADD,       on_inventory_add_cache_invalidate},
     {"ADD_XP",            PATH_ADD_XP,            on_add_xp},
     {"ZOMBIE_DEATH",      PATH_DEATH,             on_death},
     {"SERVER_DAMAGE",     PATH_SERVER_DAMAGE,     on_server_damage},
