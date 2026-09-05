@@ -1,0 +1,10 @@
+# Player-specific progression data
+data.db
+
+# Logs / temporary files
+*.log
+*.bak
+*.tmp
+
+# Backups
+backups/
