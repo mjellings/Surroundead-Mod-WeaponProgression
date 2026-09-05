@@ -1,4 +1,4 @@
--- WeaponProgression v0.14.0-dev3 - Populated live-slot selection experiment
+-- WeaponProgression v0.15.0 - Production release
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Notification discovery build based on the proven v0.12.4 persistent progression core.
@@ -50,10 +50,14 @@
 --   v0.13.0 - Production native weapon level-up notifications; notification probe hooks removed.
 --   v0.14.0-dev - Validate and reuse cached live JSI weapon slots before falling back to a full scan.
 --   v0.14.0-dev3 - Prefer GUID-matching JSI slots with populated firearm ItemStats; reject zero-stat duplicate/stub slots.
+--   v0.14.0 - Production live weapon cache with populated-slot selection and lifecycle-safe fallback.
+--   v0.15.0-dev - Read-only probe for OnHoverTooltipWidget.Update and hovered JSI_Slot_C identity.
+--   v0.15.0-dev9 - One-decimal tooltip formatting + native Weapon Level / XP / Kills rows.
+--   v0.15.0 - Production native tooltip: rounded bonus stats, Level, XP percentage and Kills; dev probe logging quieted.
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.14.0-dev3 POPULATED SLOT SELECTION"
+local VERSION = "0.15.0"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -65,6 +69,8 @@ local PATH_DEATH =
     "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C:Death"
 local PATH_JIG_TRY_ADD =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:JigTryAddItemSomewhere"
+local PATH_TOOLTIP_UPDATE =
+    "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update"
 
 local JIG_COMPONENT_CLASS = "BP_JigComponent_C"
 
@@ -149,8 +155,25 @@ local reconcile_weapon_stats = nil
 local process_pending_rewards = nil
 local cachedJigComponent = nil
 
+local QUIET_LOG_PREFIXES = {
+    "TOOLTIP PROBE |",
+    "TOOLTIP STAT |",
+    "TOOLTIP UPGRADES |",
+    "STAT W CONSTRUCT |",
+    "STAT TEXT W CONSTRUCT |",
+    "TOOLTIP FORMAT APPLY |",
+    "TOOLTIP PROGRESSION ADD |",
+    "TOOLTIP PROGRESSION TEXT APPLY |",
+    "TEXT GRID PROBE |",
+    "TEXT GRID CHILD |",
+}
+
 local function log(msg)
-    print(PREFIX .. tostring(msg) .. "\n")
+    local text = tostring(msg)
+    for _, prefix in ipairs(QUIET_LOG_PREFIXES) do
+        if text:sub(1, #prefix) == prefix then return end
+    end
+    print(PREFIX .. text .. "\n")
 end
 
 local function trim(s)
@@ -588,7 +611,7 @@ end
 
 local JSI_SLOT_CLASS = "JSI_Slot_C"
 
--- v0.14.0-dev cache instrumentation. The full v0.13.0 JSI scanner remains the
+-- v0.14.0 cache instrumentation. The full v0.13.0 JSI scanner remains the
 -- authoritative fallback. Cache entries are accepted only after the cached
 -- UObject reports IsValid(), its current ItemUniqueID decodes to the expected
 -- physical weapon GUID, and its live ItemStats can still be read.
@@ -752,7 +775,7 @@ local function try_cached_live_weapon(reason, targetUid, targetWeapon, targetUid
     end
 
     cacheCounters.hits = cacheCounters.hits + 1
-    cache_log("HIT", targetUid, targetWeapon, "validated populated slot reused | ItemStats=" .. tostring(cachedStatCount))
+    cache_log("HIT", targetUid, targetWeapon, "validated populated slot reused")
     return true
 end
 
@@ -769,7 +792,7 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
     log("JSI SCAN | reason=" .. tostring(reason) .. " | candidates=" .. tostring(count))
     if not count or count == 0 then return false end
 
-    -- v0.14.0-dev3: a physical GUID can exist on multiple live JSI_Slot_C
+    -- v0.14.0: a physical GUID can exist on multiple live JSI_Slot_C
     -- objects. dev2 proved that the highest-index duplicate may be a zero-stat
     -- stub. Collect every readable GUID match, measure its decoded firearm stat
     -- count, and prefer populated candidates. Never assume scan order implies
@@ -794,10 +817,6 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
                             statMap=statMap,
                             statCount=statCount,
                         })
-                        log("JSI MATCH CANDIDATE | index=" .. tostring(i) ..
-                            " | uid=" .. tostring(slotUid) ..
-                            " | ItemStats=" .. tostring(statCount) ..
-                            " | quality=" .. (statCount > 0 and "POPULATED" or "EMPTY"))
                     else
                         log("JSI MATCH CANDIDATE | index=" .. tostring(i) ..
                             " | uid=" .. tostring(slotUid) ..
@@ -828,11 +847,11 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
         return false
     end
 
-    -- If several populated representations exist, do not pretend scan order
+    -- If several populated representations exist, scan order alone is not authoritative.
     -- proves which is authoritative. For this dev build choose the candidate
     -- with the richest decoded firearm stat set; ties deliberately choose the
     -- earliest index because that matches the known-good pre-drop representation
-    -- observed in our current test set. Ambiguity remains loudly logged.
+    -- observed in testing. Ambiguity remains logged.
     local chosen = populated[1]
     for n = 2, #populated do
         local m = populated[n]
@@ -1586,6 +1605,577 @@ local function on_server_damage(Context, Headshot, DamagedActor, ImpactPoint, ..
     end
 end
 
+-- v0.15.0-dev2: read-only weapon-tooltip data reconnaissance.
+-- Object dump confirms Update(ItemRef : JSI_Slot_C). We only read the hovered
+-- slot's physical GUID and already-known WeaponProgression record; no widget
+-- text or gameplay state is modified in this build.
+local probe_live_stat_widgets = nil
+
+
+-- ============================================================================
+-- v0.15.0-dev6: read-only TextStatsGrid anatomy probe
+-- ============================================================================
+-- ObjectDump proves vanilla uses AddChildToUniformGrid when building tooltip
+-- text rows. Inspect the finished grid after Update so we can reproduce the
+-- same layout for Weapon Level / XP / Kills later without guessing.
+
+local function safe_call(obj, method, ...)
+    if obj == nil then return nil, false end
+    local args = {...}
+    local ok, result = pcall(function()
+        return obj[method](obj, table.unpack(args))
+    end)
+    if ok then return result, true end
+    return nil, false
+end
+
+local function probe_uniform_grid_slot(child)
+    local slot = nil
+
+    -- UWidget::Slot is exposed as a property on UMG widgets.
+    pcall(function()
+        slot = unwrap(child["Slot"])
+    end)
+
+    if slot == nil then
+        local s, ok = safe_call(child, "Slot")
+        if ok then slot = unwrap(s) end
+    end
+
+    if slot == nil then return "<slot unavailable>" end
+
+    local row, col = nil, nil
+    pcall(function() row = unwrap(slot["Row"]) end)
+    pcall(function() col = unwrap(slot["Column"]) end)
+
+    if row == nil then
+        local v, ok = safe_call(slot, "GetRow")
+        if ok then row = unwrap(v) end
+    end
+    if col == nil then
+        local v, ok = safe_call(slot, "GetColumn")
+        if ok then col = unwrap(v) end
+    end
+
+    return string.format("slot=%s row=%s col=%s",
+        full_name(slot), tostring(row or "?"), tostring(col or "?"))
+end
+
+local function textblock_text(obj)
+    if obj == nil then return nil end
+    local u = unwrap(obj)
+    if u == nil then return nil end
+    local ok, txt = pcall(function() return u:GetText() end)
+    if not ok or txt == nil then return nil end
+    local raw = unwrap(txt)
+    local ok2, s = pcall(function() return raw:ToString() end)
+    if ok2 and s ~= nil then return tostring(s) end
+    return tostring(raw)
+end
+
+local function field_text(obj, field)
+    local v, ok = safe_field(obj, field)
+    if not ok or v == nil then return nil end
+    local u = unwrap(v)
+    if u == nil then return nil end
+
+    if type(u) == "string" or type(u) == "number" or type(u) == "boolean" then
+        return tostring(u)
+    end
+
+    local tb = textblock_text(u)
+    if tb ~= nil then return tb end
+
+    local ok2, s = pcall(function() return u:ToString() end)
+    if ok2 and s ~= nil then return tostring(s) end
+
+    return full_name(u)
+end
+
+
+local function probe_text_stats_grid(tooltip)
+    local t = unwrap(tooltip)
+    if t == nil then
+        log("TEXT GRID PROBE | tooltip=<nil>")
+        return
+    end
+
+    local grid = nil
+    pcall(function() grid = unwrap(t["TextStatsGrid"]) end)
+    if grid == nil then
+        log("TEXT GRID PROBE | TextStatsGrid=<nil>")
+        return
+    end
+
+    local count = nil
+    local v, ok = safe_call(grid, "GetChildrenCount")
+    if ok then count = tonumber(unwrap(v)) end
+
+    log("TEXT GRID PROBE | grid=" .. full_name(grid) ..
+        " | children=" .. tostring(count or "?"))
+
+    if count == nil then return end
+
+    -- UPanelWidget child indices are zero-based.
+    for i = 0, count - 1 do
+        local child = nil
+        local c, got = safe_call(grid, "GetChildAt", i)
+        if got then child = unwrap(c) end
+
+        if child ~= nil then
+            local bits = {
+                "index=" .. tostring(i),
+                "child=" .. full_name(child),
+                probe_uniform_grid_slot(child)
+            }
+
+            for _, f in ipairs({"StatName", "StatValue", "TextBlock_56", "TextBlock"}) do
+                local value = field_text(child, f)
+                if value ~= nil and value ~= "" then
+                    bits[#bits + 1] = f .. "=" .. value
+                end
+            end
+
+            log("TEXT GRID CHILD | " .. table.concat(bits, " | "))
+        else
+            log("TEXT GRID CHILD | index=" .. tostring(i) .. " | <unreadable>")
+        end
+    end
+end
+
+-- Current native tooltip weapon context. Update() runs before the individual
+-- BP_StatW widgets are constructed, so this gives their Construct hook a safe,
+-- read-only lookup of the persisted enhancement for the weapon being rendered.
+local tooltipBonusContext = nil
+
+local function display_number(v)
+    local n = tonumber(v)
+    if n == nil then return nil end
+    local rounded = math.floor((n * 10) + (n >= 0 and 0.5 or -0.5)) / 10
+    if math.abs(rounded - math.floor(rounded + 0.5)) < 0.000001 then
+        return tostring(math.floor(rounded + 0.5))
+    end
+    return string.format("%.1f", rounded):gsub("0+$", ""):gsub("%.$", "")
+end
+
+local function bonus_text(v)
+    local n = tonumber(v) or 0
+    if math.abs(n) < 0.000001 then return nil end
+    return display_number(n)
+end
+
+local function set_textblock_text(block, value)
+    local b = unwrap(block)
+    if b == nil then return false, "block=nil" end
+    local textLib = nil
+    local okLib, lib = pcall(function()
+        return StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
+    end)
+    if okLib then textLib = lib end
+    if textLib == nil then return false, "KismetTextLibrary unavailable" end
+    local okSet, err = pcall(function()
+        local ftext = textLib:Conv_StringToText(tostring(value or ""))
+        if ftext == nil then error("Conv_StringToText returned nil") end
+        b:SetText(ftext)
+    end)
+    return okSet, err
+end
+
+local function unit_suffix(unit)
+    unit = trim(unit or "")
+    if unit == "" or unit == "None" then return "" end
+    if unit == "%" then return "%" end
+    return " " .. unit
+end
+
+local function add_progression_rows(tooltip, r, weaponName)
+    local t = unwrap(tooltip)
+    if t == nil or r == nil then return false end
+
+    local grid = nil
+    pcall(function() grid = unwrap(t["TextStatsGrid"]) end)
+    if grid == nil then
+        log("TOOLTIP PROGRESSION SKIP | " .. tostring(weaponName) .. " | TextStatsGrid unavailable")
+        return false
+    end
+
+    -- Do not duplicate rows if Update fires repeatedly on the same tooltip instance.
+    local count = nil
+    local countValue, countOk = safe_call(grid, "GetChildrenCount")
+    if countOk then count = tonumber(unwrap(countValue)) end
+    if count ~= nil then
+        for i = 0, count - 1 do
+            local child = nil
+            local c, got = safe_call(grid, "GetChildAt", i)
+            if got then child = unwrap(c) end
+            if child ~= nil and field_text(child, "TextBlock_56") == "Level" then
+                log("TOOLTIP PROGRESSION SKIP | " .. tostring(weaponName) .. " | rows already present")
+                return true
+            end
+        end
+    end
+
+    local widgetClass = nil
+    local okClass, cls = pcall(function()
+        return StaticFindObject("/Game/JigSInventory/Jigsaw/Widgets/BP_StatTextW.BP_StatTextW_C")
+    end)
+    if okClass then widgetClass = cls end
+    if widgetClass == nil then
+        log("TOOLTIP PROGRESSION SKIP | " .. tostring(weaponName) .. " | BP_StatTextW_C class unavailable")
+        return false
+    end
+
+    local widgetLib = nil
+    local okWbl, wbl = pcall(function()
+        return StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    end)
+    if okWbl then widgetLib = wbl end
+    if widgetLib == nil then
+        log("TOOLTIP PROGRESSION SKIP | " .. tostring(weaponName) .. " | WidgetBlueprintLibrary unavailable")
+        return false
+    end
+
+    local needed = xp_required(r.level or 1)
+    local xp = tonumber(r.xp) or 0
+    local xpPercent = 0
+    if needed ~= nil and needed > 0 then
+        xpPercent = math.max(0, math.min(100, (xp / needed) * 100))
+    end
+    local rows = {
+        { label="Level", value=tostring(math.floor(r.level or 1)), row=1, col=1 },
+        { label="XP", value=display_number(xpPercent) .. "%", row=2, col=0 },
+        { label="Kills", value=tostring(math.floor(r.kills or 0)), row=2, col=1 },
+    }
+
+    for _, info in ipairs(rows) do
+        local child = nil
+        local okCreate, created = pcall(function()
+            return widgetLib:Create(t, widgetClass, nil)
+        end)
+        if okCreate then child = unwrap(created) end
+        if child == nil then
+            log("TOOLTIP PROGRESSION FAILED | " .. tostring(weaponName) .. " | create " .. info.label)
+            return false
+        end
+
+        local okAdd, slotOrErr = pcall(function()
+            return grid:AddChildToUniformGrid(child, info.row, info.col)
+        end)
+        if not okAdd then
+            log("TOOLTIP PROGRESSION FAILED | " .. tostring(weaponName) .. " | add " .. info.label .. " | " .. tostring(slotOrErr))
+            return false
+        end
+
+        -- BP_StatTextW_C:Construct initializes the child with its blueprint
+        -- defaults (Name / None).  Apply our label/value on the next tick so
+        -- the blueprint has finished constructing before we overwrite them.
+        local delayedChild = child
+        local delayedLabel = tostring(info.label)
+        local delayedValue = tostring(info.value)
+        local delayedWeapon = tostring(weaponName)
+        ExecuteWithDelay(1, function()
+            local labelBlock, valueBlock = nil, nil
+            pcall(function() labelBlock = unwrap(delayedChild["TextBlock_56"]) end)
+            pcall(function() valueBlock = unwrap(delayedChild["TextBlock"]) end)
+
+            local okLabel, labelErr = set_textblock_text(labelBlock, delayedLabel)
+            local okValue, valueErr = set_textblock_text(valueBlock, delayedValue)
+            if okLabel and okValue then
+                log("TOOLTIP PROGRESSION TEXT APPLY | " .. delayedWeapon ..
+                    " | " .. delayedLabel .. "=" .. delayedValue)
+            else
+                log("TOOLTIP PROGRESSION TEXT FAILED | " .. delayedWeapon ..
+                    " | " .. delayedLabel ..
+                    " | label=" .. tostring(labelErr) ..
+                    " | value=" .. tostring(valueErr))
+            end
+        end)
+
+        log("TOOLTIP PROGRESSION ADD | " .. tostring(weaponName) ..
+            " | " .. info.label .. "=" .. info.value ..
+            " | row=" .. tostring(info.row) .. " col=" .. tostring(info.col) ..
+            " | delayed_text=1ms")
+    end
+
+    return true
+end
+
+local function on_tooltip_update(Context, ItemRefParam, ...)
+    tooltipBonusContext = nil
+    local slot = unwrap(ItemRefParam)
+    if slot == nil then
+        log("TOOLTIP PROBE | ItemRef=<nil>")
+        return
+    end
+
+    local uidStruct = nil
+    local okUid, rawUid = pcall(function() return slot[FIELDS.item_unique_id] end)
+    if okUid and rawUid ~= nil then uidStruct = rawUid end
+
+    local uid = guid_to_string(uidStruct)
+
+    local statsCount = nil
+    pcall(function() statsCount = safe_array_length(slot["ItemStats"]) end)
+
+    local itemName = short_name(slot)
+    local okName, nameValue = pcall(function() return slot:GetItemName() end)
+    if okName and nameValue ~= nil then
+        local rawName = unwrap(nameValue)
+        local okText, txt = pcall(function() return rawName:ToString() end)
+        if okText and txt ~= nil and tostring(txt) ~= "" then itemName = tostring(txt) end
+    end
+
+    if uid == nil then
+        log(string.format(
+            "TOOLTIP PROBE | item=%s | uid=<unresolved> | ItemStats=%s | slot=%s",
+            tostring(itemName), tostring(statsCount or "?"), full_name(slot)
+        ))
+        return
+    end
+
+    local r = records[uid]
+    if r ~= nil then
+        local needed = xp_required(r.level or 1)
+        log(string.format(
+            "TOOLTIP PROBE | item=%s | uid=%s | ItemStats=%s | record=FOUND | L%d %.3f/%d XP | kills=%d",
+            tostring(itemName), uid, tostring(statsCount or "?"),
+            math.floor(r.level or 1), tonumber(r.xp or 0) or 0, needed, math.floor(r.kills or 0)
+        ))
+
+        -- DB v2 stores bases/upgrades in nested tables. Prefer the persisted
+        -- weapon name when GetItemName() exposes a generic UI label such as
+        -- "Inventory" through the tooltip callback.
+        if (itemName == nil or itemName == "" or itemName == "Inventory") and r.weapon ~= nil then
+            itemName = tostring(r.weapon)
+        end
+
+        local liveStats = {}
+        local arr = nil
+        pcall(function() arr = slot["ItemStats"] end)
+        local arrLen = safe_array_length(arr) or 0
+        for i = 1, arrLen do
+            local stat = nil
+            pcall(function() stat = arr[i] end)
+            if stat ~= nil then
+                local tag = nil
+                local value = nil
+                pcall(function() tag = decode_gameplay_tag(stat[FIELDS.stat_name]) end)
+                pcall(function() value = tonumber(unwrap(stat[FIELDS.min_value])) end)
+                if tag ~= nil and value ~= nil then liveStats[tag] = value end
+            end
+        end
+
+        local parts = {}
+        r.bases = r.bases or {}
+        r.upgrades = r.upgrades or {}
+        tooltipBonusContext = {
+            uid = uid,
+            weapon = tostring(itemName),
+            record = r,
+            by_tag = {},
+            by_label = {},
+        }
+        for _, def in ipairs(STAT_DEFS) do
+            local base = tonumber(r.bases[def.key])
+            local count = math.floor(tonumber(r.upgrades[def.key]) or 0)
+            local live = liveStats[def.tag]
+            if base ~= nil then
+                local target = stat_target(def, base, count)
+                local bonus = (target ~= nil) and (target - base) or 0
+                log(string.format(
+                    "TOOLTIP STAT | %s | %s | base=%.3f | live=%s | target=%s | bonus=%+.3f | upgrades=%d",
+                    tostring(itemName), def.tag, base,
+                    live ~= nil and string.format("%.3f", live) or "<missing>",
+                    target ~= nil and string.format("%.3f", target) or "<nil>",
+                    bonus, count
+                ))
+                if count > 0 and target ~= nil and math.abs(bonus) >= 0.000001 then
+                    parts[#parts + 1] = string.format("%s %+0.3f", def.tag, bonus)
+                    tooltipBonusContext.by_tag[def.tag] = bonus
+                end
+            end
+        end
+        if #parts > 0 then
+            log("TOOLTIP UPGRADES | " .. itemName .. " | " .. table.concat(parts, " ; "))
+        else
+            log("TOOLTIP UPGRADES | " .. itemName .. " | none recorded")
+        end
+    else
+        log(string.format(
+            "TOOLTIP PROBE | item=%s | uid=%s | ItemStats=%s | record=NOT_FOUND",
+            tostring(itemName), uid, tostring(statsCount or "?")
+        ))
+    end
+
+    -- Update is a pre-hook; vanilla creates its BP_StatW/BP_StatTextW children
+    -- immediately afterwards. Inspect the finished UniformGrid shortly later.
+    local tooltipContext = unwrap(Context)
+    ExecuteWithDelay(75, function()
+        local valid = false
+        if tooltipContext ~= nil then
+            pcall(function() valid = tooltipContext:IsValid() end)
+        end
+        if valid then
+            local ctx = tooltipBonusContext
+            if ctx ~= nil and ctx.record ~= nil then
+                add_progression_rows(tooltipContext, ctx.record, ctx.weapon)
+            end
+            probe_text_stats_grid(tooltipContext)
+        else
+            log("TEXT GRID PROBE | tooltip no longer valid after delay")
+        end
+    end)
+
+end
+
+
+-- ============================================================================
+-- v0.15.0-dev5: dump-derived read-only stat-widget hook probe
+-- ============================================================================
+-- Exact Blueprint paths and properties confirmed by UE4SS_ObjectDump.txt.
+-- No UI writes are performed in this build.
+
+local PATH_STAT_W_CONSTRUCT =
+    "/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C:Construct"
+local PATH_STAT_TEXT_W_CONSTRUCT =
+    "/Game/JigSInventory/Jigsaw/Widgets/BP_StatTextW.BP_StatTextW_C:Construct"
+local PATH_TOOLTIP_REFRESH_STATS =
+    "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:RefreshStats"
+
+local function on_stat_w_construct(Context, ...)
+    local w = unwrap(Context)
+    if w == nil then
+        log("STAT W CONSTRUCT | context=<nil>")
+        return
+    end
+
+    local parts = {}
+    for _, f in ipairs({
+        "StatName", "VectValue", "Prefix", "ExtraText",
+        "TextBlock", "TextBlock_56", "PrefixTxt", "ExtraTxt"
+    }) do
+        local v = field_text(w, f)
+        if v ~= nil and v ~= "" then
+            parts[#parts + 1] = f .. "=" .. v
+        end
+    end
+
+    log("STAT W CONSTRUCT | widget=" .. full_name(w) ..
+        " | " .. (#parts > 0 and table.concat(parts, " ; ") or "<no readable fields>"))
+
+    local ctx = tooltipBonusContext
+    if ctx == nil then return end
+
+    local tagName = nil
+    local rawStatName, statNameOk = safe_field(w, "StatName")
+    if statNameOk and rawStatName ~= nil then
+        pcall(function() tagName = decode_gameplay_tag(unwrap(rawStatName)) end)
+    end
+
+    local label = field_text(w, "TextBlock_56")
+    local labelToTag = {
+        ["Damage"] = "Jig.Stat.FirearmDamage",
+        ["Critical Hit Multiplier"] = "Jig.Stat.CriticalHitMultiplier",
+        ["Critical Hit Chance"] = "Jig.Stat.CriticalHitChance",
+        ["RPM"] = "Jig.Stat.FirearmRPM",
+        ["Damage Falloff Range"] = "Jig.Stat.DamageFallOff",
+    }
+    if tagName == nil or ctx.by_tag[tagName] == nil then
+        tagName = labelToTag[label]
+    end
+
+    if tagName == nil then
+        log("TOOLTIP FORMAT NO MATCH | " .. tostring(ctx.weapon) ..
+            " | label=" .. tostring(label))
+        return
+    end
+    local bonus = ctx.by_tag[tagName]
+
+    local valueBlock = nil
+    pcall(function() valueBlock = unwrap(w["TextBlock"]) end)
+    local currentText = textblock_text(valueBlock)
+    if valueBlock == nil or currentText == nil then
+        log("TOOLTIP FORMAT SKIP | " .. tostring(ctx.weapon) ..
+            " | label=" .. tostring(label) .. " | reason=value_text_unavailable")
+        return
+    end
+
+    local currentNumber = tonumber(trim(currentText))
+    if currentNumber == nil then
+        log("TOOLTIP FORMAT SKIP | " .. tostring(ctx.weapon) ..
+            " | label=" .. tostring(label) .. " | reason=non_numeric_value " .. tostring(currentText))
+        return
+    end
+
+    local unit = field_text(w, "ExtraText") or field_text(w, "ExtraTxt") or ""
+    if unit == "None" then unit = "" end
+    local rendered = display_number(currentNumber) .. unit_suffix(unit)
+    local suffix = bonus_text(bonus)
+    if suffix ~= nil then
+        rendered = rendered .. " (+" .. suffix .. ")"
+    end
+
+    local okSet, setErr = set_textblock_text(valueBlock, rendered)
+
+    -- We folded % / M into the value text so clear vanilla's separate unit widget.
+    if unit ~= "" then
+        local extraBlock = nil
+        pcall(function() extraBlock = unwrap(w["ExtraTxt"]) end)
+        if extraBlock ~= nil then set_textblock_text(extraBlock, "") end
+    end
+
+    if okSet then
+        log("TOOLTIP FORMAT APPLY | " .. tostring(ctx.weapon) ..
+            " | " .. tostring(label or tagName) .. " | " .. rendered)
+    else
+        log("TOOLTIP FORMAT FAILED | " .. tostring(ctx.weapon) ..
+            " | " .. tostring(label or tagName) .. " | " .. tostring(setErr))
+    end
+end
+
+local function on_stat_text_w_construct(Context, ...)
+    local w = unwrap(Context)
+    if w == nil then
+        log("STAT TEXT W CONSTRUCT | context=<nil>")
+        return
+    end
+
+    local parts = {}
+    for _, f in ipairs({
+        "StatName", "StatValue", "TextBlock", "TextBlock_56"
+    }) do
+        local v = field_text(w, f)
+        if v ~= nil and v ~= "" then
+            parts[#parts + 1] = f .. "=" .. v
+        end
+    end
+
+    log("STAT TEXT W CONSTRUCT | widget=" .. full_name(w) ..
+        " | " .. (#parts > 0 and table.concat(parts, " ; ") or "<no readable fields>"))
+end
+
+local function on_tooltip_refresh_stats(Context, ...)
+    local w = unwrap(Context)
+    if w == nil then
+        log("TOOLTIP REFRESH STATS | context=<nil>")
+        return
+    end
+
+    local itemRef = nil
+    local ok, v = pcall(function() return w["ItemRef"] end)
+    if ok and v ~= nil then itemRef = unwrap(v) end
+
+    local uid = nil
+    if itemRef ~= nil then
+        pcall(function()
+            uid = guid_to_string(itemRef[FIELDS.item_unique_id])
+        end)
+    end
+
+    log("TOOLTIP REFRESH STATS | widget=" .. full_name(w) ..
+        " | uid=" .. tostring(uid or "<unknown>"))
+end
+
 local function on_inventory_add_cache_invalidate(Context, LocalCompParam, ItemIdParam, CountParam, AddedParam, UIDParam, ...)
     -- v0.14.0-dev2: a dropped/re-picked item can retain the same physical GUID
     -- while SurrounDead creates/rebinds JSI slot state. The old UObject may remain
@@ -1609,6 +2199,10 @@ end
 local hooks = {
     {"GET_EQUIPMENT_UID", PATH_GET_EQUIPMENT_UID, on_get_equipment_uid},
     {"JIG_TRY_ADD",       PATH_JIG_TRY_ADD,       on_inventory_add_cache_invalidate},
+    {"TOOLTIP_UPDATE",    PATH_TOOLTIP_UPDATE,    on_tooltip_update},
+    {"TOOLTIP_REFRESH",   PATH_TOOLTIP_REFRESH_STATS, on_tooltip_refresh_stats},
+    {"STAT_W_CONSTRUCT",  PATH_STAT_W_CONSTRUCT,  on_stat_w_construct},
+    {"STAT_TEXT_CONSTRUCT", PATH_STAT_TEXT_W_CONSTRUCT, on_stat_text_w_construct},
     {"ADD_XP",            PATH_ADD_XP,            on_add_xp},
     {"ZOMBIE_DEATH",      PATH_DEATH,             on_death},
     {"SERVER_DAMAGE",     PATH_SERVER_DAMAGE,     on_server_damage},
@@ -1682,6 +2276,7 @@ log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE.")
 log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native SurrounDead notification UI. STAT VERIFY DEBOUNCE active.")
 log("data.db v2 is authoritative for base stats + earned upgrades.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
+log("TOOLTIP DEV11 ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())
