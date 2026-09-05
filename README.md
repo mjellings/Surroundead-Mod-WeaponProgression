@@ -5,7 +5,7 @@ A UE4SS Lua mod for **SurrounDead** that gives individual weapons their own pers
 Instead of every weapon of the same type being identical, WeaponProgression tracks each physical weapon separately. Use a weapon in combat, earn XP with it, level it up, and receive permanent stat improvements that stay associated with that specific weapon.
 
 > **Current status:** Early development / testing  
-> **Current stable baseline:** v0.13.0  
+> **Current stable baseline:** v0.15.0  
 > **Game:** SurrounDead  
 > **Framework:** UE4SS
 
@@ -182,9 +182,9 @@ Back up your saves when testing development versions.
 
 ## Development Status
 
-### v0.13.0 — Stable Core Baseline
+### v0.15.0 — Current Stable Baseline
 
-v0.13.0 represents the first version where the core progression architecture has been successfully tested across multiple physical firearms and full game restarts.
+v0.15.0 is the current known-working release. It builds on the proven v0.13.0 progression core (per-weapon XP, permanent upgrades, persistence, and native level-up notifications), with later additions including live weapon caching (v0.14.0) and native inventory tooltip display of weapon level, XP, and kills.
 
 Testing has demonstrated:
 
@@ -200,8 +200,10 @@ Testing has demonstrated:
 - Post-mutation verification
 - Native SurrounDead level-up notifications
 - Weapon switching without progression crossing between weapons
+- Live weapon slot caching with safe fallback
+- Native tooltip rows for weapon level, XP, and kills
 
-v0.13.0 is being retained as the known-working baseline while further development continues.
+v0.15.0 is being retained as the known-working baseline while further development continues.
 
 ---
 
