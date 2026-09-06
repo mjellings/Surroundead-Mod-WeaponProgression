@@ -1,7 +1,7 @@
--- WeaponProgression v0.15.0 - Production release
+-- WeaponProgression v0.15.1 - Utility / maintenance release
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
--- Notification discovery build based on the proven v0.12.4 persistent progression core.
+-- Maintenance release based on the proven v0.15.0 progression + native tooltip core.
 --
 -- Adds:
 --   * data.db v2 stores each physical weapon's base firearm stats.
@@ -54,10 +54,11 @@
 --   v0.15.0-dev - Read-only probe for OnHoverTooltipWidget.Update and hovered JSI_Slot_C identity.
 --   v0.15.0-dev9 - One-decimal tooltip formatting + native Weapon Level / XP / Kills rows.
 --   v0.15.0 - Production native tooltip: rounded bonus stats, Level, XP percentage and Kills; dev probe logging quieted.
+--   v0.15.1 - Utility cleanup: safer DB replacement/recovery, lifecycle-safe player Jig cache, dynamic mod paths, quieter production logging, dead tooltip probes/hooks removed.
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.15.0"
+local VERSION = "0.15.1"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -72,8 +73,6 @@ local PATH_JIG_TRY_ADD =
 local PATH_TOOLTIP_UPDATE =
     "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update"
 
-local JIG_COMPONENT_CLASS = "BP_JigComponent_C"
-
 -- Confirmed JSI_Slot_C / S_ItemStat field names from the 0.8 investigation.
 local FIELDS = {
     stat_name = "STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10",
@@ -84,17 +83,31 @@ local FIELDS = {
     stats = "Stats_26_C770972746930CB80CC49AB7A6D19359",
 }
 
-local DB_PATHS = {
-    "Mods\\WeaponProgression\\data.db",
-    "ue4ss\\Mods\\WeaponProgression\\data.db",
-    ".\\Mods\\WeaponProgression\\data.db",
-}
+local function get_mod_directory()
+    local info = debug.getinfo(1, "S")
+    local source = info and info.source or nil
+    if source == nil then return nil end
+    source = tostring(source)
+    if source:sub(1, 1) == "@" then source = source:sub(2) end
+    source = source:gsub("\\", "/")
+    local scriptsDir = source:match("^(.*)/[^/]+$")
+    if scriptsDir == nil then return nil end
+    return scriptsDir:match("^(.*)/Scripts$") or scriptsDir
+end
 
-local CONFIG_PATHS = {
-    "Mods\\WeaponProgression\\config.ini",
-    "ue4ss\\Mods\\WeaponProgression\\config.ini",
-    ".\\Mods\\WeaponProgression\\config.ini",
-}
+local MOD_DIR = get_mod_directory()
+
+local function candidate_paths(fileName)
+    local paths = {}
+    if MOD_DIR ~= nil then paths[#paths + 1] = MOD_DIR .. "/" .. fileName end
+    paths[#paths + 1] = "Mods\\WeaponProgression\\" .. fileName
+    paths[#paths + 1] = "ue4ss\\Mods\\WeaponProgression\\" .. fileName
+    paths[#paths + 1] = ".\\Mods\\WeaponProgression\\" .. fileName
+    return paths
+end
+
+local DB_PATHS = candidate_paths("data.db")
+local CONFIG_PATHS = candidate_paths("config.ini")
 
 local DEFAULT_CONFIG = {
     WeaponXPMultiplier = 1.0,
@@ -107,6 +120,7 @@ local DEFAULT_CONFIG = {
     RPMPercent = 2.0,
     FalloffPercent = 2.0,
     PreventConsecutiveSameStat = true,
+    VerboseLogging = false,
 }
 
 local Config = {
@@ -120,6 +134,7 @@ local Config = {
     RPMPercent = DEFAULT_CONFIG.RPMPercent,
     FalloffPercent = DEFAULT_CONFIG.FalloffPercent,
     PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat,
+    VerboseLogging = DEFAULT_CONFIG.VerboseLogging,
     LevelThresholds = {},
 }
 
@@ -156,22 +171,35 @@ local process_pending_rewards = nil
 local cachedJigComponent = nil
 
 local QUIET_LOG_PREFIXES = {
+    -- Routine per-hit/cache chatter. Failures and mismatches intentionally remain visible.
+    "DAMAGE |",
+    "FIREARM LIVE STAT |",
+    "LIVE CACHE ",
+    "JSI SCAN |",
+    "JSI MATCH |",
+    "JSI MATCH STAT |",
+    "JSI MATCH COMPLETE |",
+    "MUTATION UID |",
+    "DIRECT JIG RESOLVE SUCCESS |",
+    "STAT RECONCILE |",
+    "STAT VERIFY DEBOUNCE |",
+    "STAT VERIFY OK |",
+    "STAT VERIFY COMPLETE |",
     "TOOLTIP PROBE |",
     "TOOLTIP STAT |",
     "TOOLTIP UPGRADES |",
     "STAT W CONSTRUCT |",
-    "STAT TEXT W CONSTRUCT |",
     "TOOLTIP FORMAT APPLY |",
     "TOOLTIP PROGRESSION ADD |",
     "TOOLTIP PROGRESSION TEXT APPLY |",
-    "TEXT GRID PROBE |",
-    "TEXT GRID CHILD |",
 }
 
 local function log(msg)
     local text = tostring(msg)
-    for _, prefix in ipairs(QUIET_LOG_PREFIXES) do
-        if text:sub(1, #prefix) == prefix then return end
+    if not Config.VerboseLogging then
+        for _, prefix in ipairs(QUIET_LOG_PREFIXES) do
+            if text:sub(1, #prefix) == prefix then return end
+        end
     end
     print(PREFIX .. text .. "\n")
 end
@@ -299,11 +327,6 @@ end
 -- v0.10.1 used FindFirstOf(BP_JigComponent), which can resolve the wrong
 -- inventory component. This build does NOT use that route for the stat write.
 
-local PROCESS_DELAY_MS = 250
-local PROCESS_RETRY_MS = 250
-local PROCESS_MAX_ATTEMPTS = 12
-local devMutationProcessing = false
-
 local function safe_array_length(arr)
     if arr == nil then return nil end
     local ok, len = pcall(function() return #arr end)
@@ -352,18 +375,29 @@ local capturedPlayerJigSource = nil
 local PLAYER_CHARACTER_CLASS = "BP_PlayerCharacter_C"
 local PLAYER_JIG_FIELD = "BP_JigMultiplayer"
 
+local function object_is_valid(obj)
+    if obj == nil then return false end
+    local ok, valid = pcall(function() return obj:IsValid() end)
+    return ok and valid == true
+end
+
 local function resolve_player_jig_direct(reason)
     if capturedPlayerJigComponent ~= nil then
-        return capturedPlayerJigComponent
+        if object_is_valid(capturedPlayerJigComponent) then
+            return capturedPlayerJigComponent
+        end
+        capturedPlayerJigComponent = nil
+        capturedPlayerJigSource = nil
+        log("DIRECT JIG RESOLVE | reason=" .. tostring(reason) .. " | cached_component_invalid; reacquiring")
     end
 
     local okPlayer, player = pcall(function()
         return FindFirstOf(PLAYER_CHARACTER_CLASS)
     end)
 
-    if not okPlayer or player == nil then
+    if not okPlayer or not object_is_valid(player) then
         log("DIRECT JIG RESOLVE | reason=" .. tostring(reason) ..
-            " | player=NOT_FOUND")
+            " | player=NOT_FOUND_OR_INVALID")
         return nil
     end
 
@@ -371,9 +405,9 @@ local function resolve_player_jig_direct(reason)
         return player[PLAYER_JIG_FIELD]
     end)
 
-    if not okJig or jig == nil then
+    if not okJig or not object_is_valid(jig) then
         log("DIRECT JIG RESOLVE | reason=" .. tostring(reason) ..
-            " | player=FOUND | BP_JigMultiplayer=NOT_FOUND")
+            " | player=FOUND | BP_JigMultiplayer=NOT_FOUND_OR_INVALID")
         return nil
     end
 
@@ -387,226 +421,11 @@ local function resolve_player_jig_direct(reason)
     return jig
 end
 
-local mappedInventoryItems = {}
-local mapperDumpedUIDs = {}
-local referenceSlotSnapshot = nil
-
 local function safe_field(obj, key)
     if obj == nil then return nil, false end
     local ok, value = pcall(function() return obj[key] end)
     if ok then return value, true end
     return nil, false
-end
-
-local function describe_value(value)
-    if value == nil then return "<nil>" end
-    local t = type(value)
-    if t == "string" or t == "number" or t == "boolean" then
-        return tostring(value)
-    end
-    local okName, n = pcall(function() return full_name(value) end)
-    if okName and n and n ~= "" then return n end
-    return tostring(value)
-end
-
-local function dump_stat_array(label, arr)
-    if arr == nil then
-        log(label .. " | array=<nil>")
-        return 0
-    end
-    local len = safe_array_length(arr)
-    log(label .. " | count=" .. tostring(len))
-    if not len or len == 0 then return len or 0 end
-
-    for i = 1, len do
-        local okEntry, entry = pcall(function() return arr[i] end)
-        if okEntry and entry ~= nil then
-            local tagName, value = "<unknown>", "<unknown>"
-            pcall(function()
-                tagName = decode_gameplay_tag(entry[FIELDS.stat_name]) or "<unknown>"
-            end)
-            pcall(function()
-                value = tostring(entry[FIELDS.min_value])
-            end)
-            log(string.format("%s STAT | index=%d | tag=%s | value=%s",
-                label, i, tostring(tagName), tostring(value)))
-        end
-    end
-    return len
-end
-
-local function safe_call(label, fn)
-    local ok, value = pcall(fn)
-    if ok then
-        log(label .. "=" .. tostring(value))
-        return value, true
-    end
-    log(label .. "=<error:" .. tostring(value) .. ">")
-    return nil, false
-end
-
-local function safe_object_identity(label, obj)
-    if obj == nil then
-        log(label .. " | object=<nil>")
-        return
-    end
-
-    log(label .. " | tostring=" .. tostring(obj))
-
-    safe_call(label .. " | GetFullName", function()
-        return obj:GetFullName()
-    end)
-
-    safe_call(label .. " | GetFName", function()
-        local n = obj:GetFName()
-        if n == nil then return "<nil>" end
-        local okS, s = pcall(function() return n:ToString() end)
-        return okS and s or tostring(n)
-    end)
-
-    safe_call(label .. " | GetClass", function()
-        local cls = obj:GetClass()
-        if cls == nil then return "<nil>" end
-        local okF, f = pcall(function() return cls:GetFullName() end)
-        if okF and f ~= nil then return f end
-        return tostring(cls)
-    end)
-
-    safe_call(label .. " | GetOuter", function()
-        local outer = obj:GetOuter()
-        if outer == nil then return "<nil>" end
-        local okF, f = pcall(function() return outer:GetFullName() end)
-        if okF and f ~= nil then return f end
-        return tostring(outer)
-    end)
-end
-
-local function dump_slot_anatomy(label, slotObj, expectedUid)
-    -- v0.10.8: only a fresh JigTryAddItemSomewhere slot gets field reads.
-    -- Crusher itself is identity-only because v0.10.7 proved arbitrary reads can crash.
-    safe_object_identity(label, slotObj)
-
-    if label:find("ANATOMY FRESH", 1, true) then
-        local nativeStats, nativeStatsOk = safe_field(slotObj, "ItemStats")
-        if nativeStatsOk then
-            dump_stat_array(label .. " | native ItemStats", nativeStats)
-        else
-            log(label .. " | native ItemStats=<field unreadable>")
-        end
-
-        local uidValue, uidOk = safe_field(slotObj, FIELDS.item_unique_id)
-        if uidOk and uidValue ~= nil then
-            local nativeUid = nil
-            pcall(function() nativeUid = guid_to_string(uidValue) end)
-            log(label .. " | ItemUniqueID=" .. tostring(nativeUid or describe_value(uidValue)) ..
-                " | expected=" .. tostring(expectedUid))
-        end
-    end
-end
-
-
-local function dump_mapped_slot(jigComponent, uidStruct, uid, itemName, reason)
-    local foundOut = {}
-    local okFind, findErr = pcall(function()
-        return jigComponent:FindItemByUID(uidStruct, foundOut)
-    end)
-    if not okFind then
-        log(string.format("UID MAP | item=%s | jig_uid=%s | lookup_error=%s",
-            tostring(itemName), tostring(uid), tostring(findErr)))
-        return
-    end
-
-    local found = foundOut["Found"] or foundOut["found"] or
-                  foundOut["Value"] or foundOut["value"] or foundOut[1]
-    if found == nil then
-        log(string.format("UID MAP SLOT | item=%s | jig_uid=%s | NOT_RESOLVED | reason=%s",
-            tostring(itemName), tostring(uid), tostring(reason)))
-        return
-    end
-
-    local okStats, statsArr = pcall(function() return found["ItemStats"] end)
-    local len = okStats and safe_array_length(statsArr) or nil
-
-    log(string.format("UID MAP SLOT | item=%s | jig_uid=%s | ItemStats=%s | reason=%s",
-        tostring(itemName), tostring(uid), tostring(len), tostring(reason)))
-
-    dump_slot_anatomy("ANATOMY FRESH " .. tostring(itemName), found, uid)
-    if referenceSlotSnapshot == nil then
-        referenceSlotSnapshot = {
-            item = tostring(itemName),
-            uid = tostring(uid),
-            slot = found
-        }
-        log("ANATOMY REFERENCE | stored fresh slot reference from " .. tostring(itemName))
-    end
-
-    if len and len > 0 then
-        for i = 1, len do
-            local okEntry, entry = pcall(function() return statsArr[i] end)
-            if okEntry and entry ~= nil then
-                local tagName, value = "<unknown>", "<unknown>"
-                pcall(function()
-                    tagName = decode_gameplay_tag(entry[FIELDS.stat_name]) or "<unknown>"
-                end)
-                pcall(function()
-                    value = tostring(entry[FIELDS.min_value])
-                end)
-                log(string.format(
-                    "UID MAP STAT | item=%s | jig_uid=%s | index=%d | tag=%s | value=%s",
-                    tostring(itemName), tostring(uid), i, tostring(tagName), tostring(value)))
-            end
-        end
-    end
-end
-
-local function remember_inventory_uid(jigComponent, uidStruct, uid, itemName, reason)
-    if not uid or not uidStruct then return end
-    mappedInventoryItems[uid] = {name=itemName or "<unknown>", uidStruct=uidStruct}
-    if mapperDumpedUIDs[uid] then return end
-    mapperDumpedUIDs[uid] = true
-    dump_mapped_slot(jigComponent, uidStruct, uid, itemName, reason)
-end
-
-
-local scan_live_jsi_slots
-
-local function on_jig_context_capture(Context, LocalCompParam, ItemIdParam, CountParam, AddedParam, UIDParam, ...)
-    local okCtx, jigComponent = pcall(function() return Context:get() end)
-    if not okCtx or jigComponent == nil then
-        return
-    end
-
-    capturedPlayerJigComponent = jigComponent
-    capturedPlayerJigSource = "JigTryAddItemSomewhere"
-
-    local itemName = "<unknown>"
-    pcall(function()
-        local itemObj = ItemIdParam:get()
-        if itemObj ~= nil then itemName = short_name(itemObj) end
-    end)
-
-    local capturedUid = "<unknown>"
-    pcall(function()
-        local uidStruct = UIDParam:get()
-        local decoded = guid_to_string(uidStruct)
-        if decoded ~= nil then capturedUid = decoded end
-    end)
-
-    log(string.format(
-        "JIG CONTEXT CAPTURE | source=%s | item=%s | uid=%s | component=%s",
-        capturedPlayerJigSource, itemName, capturedUid, full_name(jigComponent)
-    ))
-
-    local okU, capturedUidStruct = pcall(function() return UIDParam:get() end)
-    if okU and capturedUidStruct ~= nil and capturedUid ~= "<unknown>" then
-        ExecuteWithDelay(PROCESS_DELAY_MS, function()
-            remember_inventory_uid(jigComponent, capturedUidStruct, capturedUid,
-                                   itemName, "JigTryAddItemSomewhere")
-            ExecuteWithDelay(250, function()
-                scan_live_jsi_slots("FreshInventoryAdd:" .. tostring(itemName), nil, itemName)
-            end)
-        end)
-    end
 end
 
 local JSI_SLOT_CLASS = "JSI_Slot_C"
@@ -996,6 +815,7 @@ local function reset_config()
     Config.RPMPercent = DEFAULT_CONFIG.RPMPercent
     Config.FalloffPercent = DEFAULT_CONFIG.FalloffPercent
     Config.PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat
+    Config.VerboseLogging = DEFAULT_CONFIG.VerboseLogging
     Config.LevelThresholds = {}
 end
 
@@ -1104,6 +924,16 @@ local function load_config()
                     elseif section == "StatUpgrades" then
                         set_stat_upgrade_value(key, value)
 
+                    elseif section == "Utility" and key == "VerboseLogging" then
+                        local b = value:lower()
+                        if b == "true" or b == "1" or b == "yes" or b == "on" then
+                            Config.VerboseLogging = true
+                        elseif b == "false" or b == "0" or b == "no" or b == "off" then
+                            Config.VerboseLogging = false
+                        else
+                            log("CONFIG WARNING | ignored invalid boolean VerboseLogging=" .. tostring(value))
+                        end
+
                     elseif section == "LevelThresholds" then
                         local targetLevel = tonumber(key:match("^Level(%d+)$"))
                         local threshold = tonumber(value)
@@ -1142,6 +972,7 @@ local function load_config()
         Config.DamagePercent, Config.CriticalChancePoints, Config.CriticalMultiplierPoints,
         Config.RPMPercent, Config.FalloffPercent, tostring(Config.PreventConsecutiveSameStat)
     ))
+    log("UTILITY CONFIG | verbose_logging=" .. tostring(Config.VerboseLogging))
 
     if overrideCount > 0 then
         local levels = {}
@@ -1191,6 +1022,22 @@ local function ensure_db_file()
         local existing = io.open(path, "r")
         if existing then existing:close(); dbPath = path; return true end
 
+        -- v0.15.1: if a previous replacement was interrupted after rotating the
+        -- old database to .bak, recover that last-known-good copy before ever
+        -- creating a fresh empty database.
+        local backupPath = path .. ".bak"
+        local backup = io.open(backupPath, "r")
+        if backup then
+            backup:close()
+            local recovered, recoverErr = os.rename(backupPath, path)
+            if recovered then
+                dbPath = path
+                log("DATABASE RECOVERY | restored last-known-good " .. backupPath)
+                return true
+            end
+            log("DATABASE RECOVERY FAILED | " .. tostring(recoverErr))
+        end
+
         local f = io.open(path, "w")
         if f then
             f:write("# WeaponProgression data.db v2\n")
@@ -1214,6 +1061,7 @@ local function split_tabs(line)
 end
 
 local function load_db()
+    records = {}
     if not ensure_db_file() then log("ERROR: could not find/create a writable data.db."); return end
     log("Database path: " .. dbPath)
 
@@ -1227,19 +1075,19 @@ local function load_db()
             if uid and uid ~= "" then
                 -- v1 compatibility: first five columns remain identical.
                 local r = {
-                    level=tonumber(c[2]) or 1,
-                    xp=tonumber(c[3]) or 0,
-                    kills=tonumber(c[4]) or 0,
+                    level=math.max(1, math.floor(tonumber(c[2]) or 1)),
+                    xp=math.max(0, tonumber(c[3]) or 0),
+                    kills=math.max(0, math.floor(tonumber(c[4]) or 0)),
                     weapon=(c[5] and c[5] ~= "") and c[5] or "Unknown",
                     last_upgrade=c[6] or "",
-                    pending_rewards=tonumber(c[17]) or 0,
+                    pending_rewards=math.max(0, math.floor(tonumber(c[17]) or 0)),
                     bases={}, upgrades={}
                 }
-                r.bases.damage = tonumber(c[7]);      r.upgrades.damage = tonumber(c[8]) or 0
-                r.bases.critmult = tonumber(c[9]);    r.upgrades.critmult = tonumber(c[10]) or 0
-                r.bases.critchance = tonumber(c[11]); r.upgrades.critchance = tonumber(c[12]) or 0
-                r.bases.rpm = tonumber(c[13]);         r.upgrades.rpm = tonumber(c[14]) or 0
-                r.bases.falloff = tonumber(c[15]);     r.upgrades.falloff = tonumber(c[16]) or 0
+                r.bases.damage = tonumber(c[7]);      r.upgrades.damage = math.max(0, math.floor(tonumber(c[8]) or 0))
+                r.bases.critmult = tonumber(c[9]);    r.upgrades.critmult = math.max(0, math.floor(tonumber(c[10]) or 0))
+                r.bases.critchance = tonumber(c[11]); r.upgrades.critchance = math.max(0, math.floor(tonumber(c[12]) or 0))
+                r.bases.rpm = tonumber(c[13]);         r.upgrades.rpm = math.max(0, math.floor(tonumber(c[14]) or 0))
+                r.bases.falloff = tonumber(c[15]);     r.upgrades.falloff = math.max(0, math.floor(tonumber(c[16]) or 0))
                 records[uid] = r
             end
         end
@@ -1277,9 +1125,36 @@ save_db = function()
     end
     f:close()
 
-    os.remove(dbPath)
+    -- v0.15.1: never delete the live DB before the replacement is ready. Rotate
+    -- it to .bak first, then promote the fully-written .tmp. If promotion fails,
+    -- restore the backup. The .bak remains as the previous known-good snapshot.
+    local backup = dbPath .. ".bak"
+    os.remove(backup)
+
+    local hadExisting = false
+    local existing = io.open(dbPath, "r")
+    if existing then existing:close(); hadExisting = true end
+
+    if hadExisting then
+        local rotated, rotateErr = os.rename(dbPath, backup)
+        if not rotated then
+            os.remove(tmp)
+            log("ERROR rotating data.db to backup: " .. tostring(rotateErr))
+            return false
+        end
+    end
+
     local ok,err=os.rename(tmp,dbPath)
-    if not ok then log("ERROR replacing data.db: " .. tostring(err)); return false end
+    if not ok then
+        if hadExisting then
+            local restored, restoreErr = os.rename(backup, dbPath)
+            if not restored then
+                log("CRITICAL: data.db promotion failed and backup restore also failed: " .. tostring(restoreErr))
+            end
+        end
+        log("ERROR replacing data.db: " .. tostring(err))
+        return false
+    end
     return true
 end
 
@@ -1407,13 +1282,25 @@ local function award_stat_upgrade(uid, weaponName, newLevel)
         return false
     end
 
+    local previousLastUpgrade = r.last_upgrade
     r.upgrades[def.key]=(r.upgrades[def.key] or 0)+1
     r.last_upgrade=def.key
     local base=r.bases[def.key]
     local target=stat_target(def,base,r.upgrades[def.key])
 
-    -- Persist the earned reward BEFORE attempting the runtime write.
+    -- Persist the earned reward BEFORE attempting the runtime write. A failed
+    -- persistence write must never create a live-only upgrade that disappears
+    -- on restart, so roll the in-memory reward back and defer application.
     local saved=save_db()
+    if not saved then
+        r.upgrades[def.key]=math.max(0,(r.upgrades[def.key] or 1)-1)
+        r.last_upgrade=previousLastUpgrade or ""
+        r.pending_rewards=(r.pending_rewards or 0)+1
+        log("STAT UPGRADE DEFERRED | " .. tostring(weaponName) .. " | " .. tostring(uid) ..
+            " | L" .. tostring(newLevel) .. " | database write failed; live mutation refused")
+        return false
+    end
+
     log(string.format(
         "STAT UPGRADE AWARDED | %s | %s | L%d | %s | base=%.6g | count=%d | target=%.6g | saved=%s",
         weaponName,uid,newLevel,def.tag,base,r.upgrades[def.key],target,tostring(saved)
@@ -1605,20 +1492,6 @@ local function on_server_damage(Context, Headshot, DamagedActor, ImpactPoint, ..
     end
 end
 
--- v0.15.0-dev2: read-only weapon-tooltip data reconnaissance.
--- Object dump confirms Update(ItemRef : JSI_Slot_C). We only read the hovered
--- slot's physical GUID and already-known WeaponProgression record; no widget
--- text or gameplay state is modified in this build.
-local probe_live_stat_widgets = nil
-
-
--- ============================================================================
--- v0.15.0-dev6: read-only TextStatsGrid anatomy probe
--- ============================================================================
--- ObjectDump proves vanilla uses AddChildToUniformGrid when building tooltip
--- text rows. Inspect the finished grid after Update so we can reproduce the
--- same layout for Weapon Level / XP / Kills later without guessing.
-
 local function safe_call(obj, method, ...)
     if obj == nil then return nil, false end
     local args = {...}
@@ -1627,38 +1500,6 @@ local function safe_call(obj, method, ...)
     end)
     if ok then return result, true end
     return nil, false
-end
-
-local function probe_uniform_grid_slot(child)
-    local slot = nil
-
-    -- UWidget::Slot is exposed as a property on UMG widgets.
-    pcall(function()
-        slot = unwrap(child["Slot"])
-    end)
-
-    if slot == nil then
-        local s, ok = safe_call(child, "Slot")
-        if ok then slot = unwrap(s) end
-    end
-
-    if slot == nil then return "<slot unavailable>" end
-
-    local row, col = nil, nil
-    pcall(function() row = unwrap(slot["Row"]) end)
-    pcall(function() col = unwrap(slot["Column"]) end)
-
-    if row == nil then
-        local v, ok = safe_call(slot, "GetRow")
-        if ok then row = unwrap(v) end
-    end
-    if col == nil then
-        local v, ok = safe_call(slot, "GetColumn")
-        if ok then col = unwrap(v) end
-    end
-
-    return string.format("slot=%s row=%s col=%s",
-        full_name(slot), tostring(row or "?"), tostring(col or "?"))
 end
 
 local function textblock_text(obj)
@@ -1693,56 +1534,6 @@ local function field_text(obj, field)
 end
 
 
-local function probe_text_stats_grid(tooltip)
-    local t = unwrap(tooltip)
-    if t == nil then
-        log("TEXT GRID PROBE | tooltip=<nil>")
-        return
-    end
-
-    local grid = nil
-    pcall(function() grid = unwrap(t["TextStatsGrid"]) end)
-    if grid == nil then
-        log("TEXT GRID PROBE | TextStatsGrid=<nil>")
-        return
-    end
-
-    local count = nil
-    local v, ok = safe_call(grid, "GetChildrenCount")
-    if ok then count = tonumber(unwrap(v)) end
-
-    log("TEXT GRID PROBE | grid=" .. full_name(grid) ..
-        " | children=" .. tostring(count or "?"))
-
-    if count == nil then return end
-
-    -- UPanelWidget child indices are zero-based.
-    for i = 0, count - 1 do
-        local child = nil
-        local c, got = safe_call(grid, "GetChildAt", i)
-        if got then child = unwrap(c) end
-
-        if child ~= nil then
-            local bits = {
-                "index=" .. tostring(i),
-                "child=" .. full_name(child),
-                probe_uniform_grid_slot(child)
-            }
-
-            for _, f in ipairs({"StatName", "StatValue", "TextBlock_56", "TextBlock"}) do
-                local value = field_text(child, f)
-                if value ~= nil and value ~= "" then
-                    bits[#bits + 1] = f .. "=" .. value
-                end
-            end
-
-            log("TEXT GRID CHILD | " .. table.concat(bits, " | "))
-        else
-            log("TEXT GRID CHILD | index=" .. tostring(i) .. " | <unreadable>")
-        end
-    end
-end
-
 -- Current native tooltip weapon context. Update() runs before the individual
 -- BP_StatW widgets are constructed, so this gives their Construct hook a safe,
 -- read-only lookup of the persisted enhancement for the weapon being rendered.
@@ -1764,14 +1555,21 @@ local function bonus_text(v)
     return display_number(n)
 end
 
-local function set_textblock_text(block, value)
-    local b = unwrap(block)
-    if b == nil then return false, "block=nil" end
-    local textLib = nil
+local tooltipTextLibrary = nil
+
+local function get_tooltip_text_library()
+    if tooltipTextLibrary ~= nil then return tooltipTextLibrary end
     local okLib, lib = pcall(function()
         return StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
     end)
-    if okLib then textLib = lib end
+    if okLib and lib ~= nil then tooltipTextLibrary = lib end
+    return tooltipTextLibrary
+end
+
+local function set_textblock_text(block, value)
+    local b = unwrap(block)
+    if b == nil then return false, "block=nil" end
+    local textLib = get_tooltip_text_library()
     if textLib == nil then return false, "KismetTextLibrary unavailable" end
     local okSet, err = pcall(function()
         local ftext = textLib:Conv_StringToText(tostring(value or ""))
@@ -2020,7 +1818,6 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
             if ctx ~= nil and ctx.record ~= nil then
                 add_progression_rows(tooltipContext, ctx.record, ctx.weapon)
             end
-            probe_text_stats_grid(tooltipContext)
         else
             log("TEXT GRID PROBE | tooltip no longer valid after delay")
         end
@@ -2030,17 +1827,11 @@ end
 
 
 -- ============================================================================
--- v0.15.0-dev5: dump-derived read-only stat-widget hook probe
+-- Native tooltip stat formatting hooks
 -- ============================================================================
--- Exact Blueprint paths and properties confirmed by UE4SS_ObjectDump.txt.
--- No UI writes are performed in this build.
 
 local PATH_STAT_W_CONSTRUCT =
     "/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C:Construct"
-local PATH_STAT_TEXT_W_CONSTRUCT =
-    "/Game/JigSInventory/Jigsaw/Widgets/BP_StatTextW.BP_StatTextW_C:Construct"
-local PATH_TOOLTIP_REFRESH_STATS =
-    "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:RefreshStats"
 
 local function on_stat_w_construct(Context, ...)
     local w = unwrap(Context)
@@ -2133,49 +1924,6 @@ local function on_stat_w_construct(Context, ...)
     end
 end
 
-local function on_stat_text_w_construct(Context, ...)
-    local w = unwrap(Context)
-    if w == nil then
-        log("STAT TEXT W CONSTRUCT | context=<nil>")
-        return
-    end
-
-    local parts = {}
-    for _, f in ipairs({
-        "StatName", "StatValue", "TextBlock", "TextBlock_56"
-    }) do
-        local v = field_text(w, f)
-        if v ~= nil and v ~= "" then
-            parts[#parts + 1] = f .. "=" .. v
-        end
-    end
-
-    log("STAT TEXT W CONSTRUCT | widget=" .. full_name(w) ..
-        " | " .. (#parts > 0 and table.concat(parts, " ; ") or "<no readable fields>"))
-end
-
-local function on_tooltip_refresh_stats(Context, ...)
-    local w = unwrap(Context)
-    if w == nil then
-        log("TOOLTIP REFRESH STATS | context=<nil>")
-        return
-    end
-
-    local itemRef = nil
-    local ok, v = pcall(function() return w["ItemRef"] end)
-    if ok and v ~= nil then itemRef = unwrap(v) end
-
-    local uid = nil
-    if itemRef ~= nil then
-        pcall(function()
-            uid = guid_to_string(itemRef[FIELDS.item_unique_id])
-        end)
-    end
-
-    log("TOOLTIP REFRESH STATS | widget=" .. full_name(w) ..
-        " | uid=" .. tostring(uid or "<unknown>"))
-end
-
 local function on_inventory_add_cache_invalidate(Context, LocalCompParam, ItemIdParam, CountParam, AddedParam, UIDParam, ...)
     -- v0.14.0-dev2: a dropped/re-picked item can retain the same physical GUID
     -- while SurrounDead creates/rebinds JSI slot state. The old UObject may remain
@@ -2200,9 +1948,7 @@ local hooks = {
     {"GET_EQUIPMENT_UID", PATH_GET_EQUIPMENT_UID, on_get_equipment_uid},
     {"JIG_TRY_ADD",       PATH_JIG_TRY_ADD,       on_inventory_add_cache_invalidate},
     {"TOOLTIP_UPDATE",    PATH_TOOLTIP_UPDATE,    on_tooltip_update},
-    {"TOOLTIP_REFRESH",   PATH_TOOLTIP_REFRESH_STATS, on_tooltip_refresh_stats},
     {"STAT_W_CONSTRUCT",  PATH_STAT_W_CONSTRUCT,  on_stat_w_construct},
-    {"STAT_TEXT_CONSTRUCT", PATH_STAT_TEXT_W_CONSTRUCT, on_stat_text_w_construct},
     {"ADD_XP",            PATH_ADD_XP,            on_add_xp},
     {"ZOMBIE_DEATH",      PATH_DEATH,             on_death},
     {"SERVER_DAMAGE",     PATH_SERVER_DAMAGE,     on_server_damage},
@@ -2272,11 +2018,11 @@ end
 
 log("----------------------------------------------------------------")
 log("WeaponProgression v" .. VERSION)
-log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE.")
+log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; utility safeguards v0.15.1 ACTIVE.")
 log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native SurrounDead notification UI. STAT VERIFY DEBOUNCE active.")
-log("data.db v2 is authoritative for base stats + earned upgrades.")
+log("data.db v2 is authoritative for base stats + earned upgrades; previous snapshot retained as data.db.bak.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
-log("TOOLTIP DEV11 ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
+log("NATIVE TOOLTIP ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())
