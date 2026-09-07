@@ -1,7 +1,8 @@
--- WeaponProgression v0.15.1 - Utility / maintenance release
+-- WeaponProgression v0.16.0-dev1 - Reusable native UI integration
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
--- Maintenance release based on the proven v0.15.0 progression + native tooltip core.
+-- Development build based on the proven v0.15.1 progression + utility core.
+-- Adds the reusable Scripts/ui.lua native UMG panel and authoritative active-weapon UI bridge.
 --
 -- Adds:
 --   * data.db v2 stores each physical weapon's base firearm stats.
@@ -55,10 +56,13 @@
 --   v0.15.0-dev9 - One-decimal tooltip formatting + native Weapon Level / XP / Kills rows.
 --   v0.15.0 - Production native tooltip: rounded bonus stats, Level, XP percentage and Kills; dev probe logging quieted.
 --   v0.15.1 - Utility cleanup: safer DB replacement/recovery, lifecycle-safe player Jig cache, dynamic mod paths, quieter production logging, dead tooltip probes/hooks removed.
+--   v0.16.0-dev1 - Reusable ui.lua panel integrated; F8 shows live held-weapon Level / XP using active slot -> physical UID mapping.
+--   v0.16.0-dev2 - Stabilise active UI UID during combat callbacks; auto-close panel after 3s and reset timer on weapon switch.
+--   v0.16.0-dev3 - Compact native-style status card with aligned stats, divider and native UMG XP progress bar.
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.15.1"
+local VERSION = "0.16.0-dev3"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -72,6 +76,12 @@ local PATH_JIG_TRY_ADD =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:JigTryAddItemSomewhere"
 local PATH_TOOLTIP_UPDATE =
     "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update"
+local PATH_GET_ACTIVE_WEAPON =
+    "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeapon"
+local PATH_GET_ACTIVE_WEAPON_SLOT =
+    "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeaponSlot"
+local PATH_GET_EQUIPPED_ITEM_REF =
+    "/Game/JigSInventory/Jigsaw/Widgets/JSIContainer.JSIContainer_C:GetEquippedItemRef"
 
 -- Confirmed JSI_Slot_C / S_ItemStat field names from the 0.8 investigation.
 local FIELDS = {
@@ -192,6 +202,8 @@ local QUIET_LOG_PREFIXES = {
     "TOOLTIP FORMAT APPLY |",
     "TOOLTIP PROGRESSION ADD |",
     "TOOLTIP PROGRESSION TEXT APPLY |",
+    "UI STATE |",
+    "UI EQUIPPED |",
 }
 
 local function log(msg)
@@ -203,6 +215,49 @@ local function log(msg)
     end
     print(PREFIX .. text .. "\n")
 end
+
+-- ============================================================================
+-- Reusable native UI module
+-- ============================================================================
+
+local UI = nil
+
+local function load_ui_module()
+    local errors = {}
+
+    -- Preferred route: ui.lua lives beside main.lua in Scripts/. This avoids
+    -- depending on UE4SS package.path details and keeps the mod self-contained.
+    if MOD_DIR ~= nil then
+        local uiPath = MOD_DIR .. "/Scripts/ui.lua"
+        local okLoad, chunkOrErr = pcall(loadfile, uiPath)
+        if okLoad and type(chunkOrErr) == "function" then
+            local okRun, moduleOrErr = pcall(chunkOrErr)
+            if okRun and type(moduleOrErr) == "table" then
+                UI = moduleOrErr
+                log("UI MODULE | loaded " .. uiPath)
+                return true
+            end
+            errors[#errors + 1] = "loadfile run: " .. tostring(moduleOrErr)
+        else
+            errors[#errors + 1] = "loadfile: " .. tostring(chunkOrErr)
+        end
+    end
+
+    -- Fallback for UE4SS installations that expose the Scripts directory on
+    -- package.path.
+    local okRequire, moduleOrErr = pcall(require, "ui")
+    if okRequire and type(moduleOrErr) == "table" then
+        UI = moduleOrErr
+        log("UI MODULE | loaded via require(\"ui\")")
+        return true
+    end
+
+    errors[#errors + 1] = "require: " .. tostring(moduleOrErr)
+    log("UI MODULE DISABLED | " .. table.concat(errors, " | "))
+    return false
+end
+
+load_ui_module()
 
 local function trim(s)
     if s == nil then return "" end
@@ -1009,6 +1064,490 @@ local function xp_required(currentLevel)
 end
 
 -- ============================================================================
+-- Reusable UI state bridge
+-- ============================================================================
+--
+-- ui.lua is presentation-only. main.lua owns active-weapon discovery, physical
+-- UID resolution and progression calculations, then supplies a tiny state table.
+--
+-- Proven SurrounDead 0.8 route:
+--   GetActiveWeaponSlot GameplayTag
+--       -> CPrimary / CSecondary / CPistol / CMelee
+--       -> GetEquippedItemRef JSI_Slot_C.ItemUniqueID
+--       -> records[physical UID]
+--
+-- A one-time top-level JSI slot scan on first F8 open handles the case where
+-- those Blueprint callbacks have not fired since this Lua mod loaded.
+
+local uiActive = {
+    weapon = nil,
+    slot_tag = nil,
+    container = nil,
+    uid = nil,
+    firearm = false,
+}
+
+local uiEquipped = {}
+local uiPendingEquipped = {}
+local uiLastStateSignature = nil
+local uiLastEquippedSignature = {}
+
+-- Popup-style lifecycle. ExecuteWithDelay cannot be cancelled, so a generation
+-- token invalidates older close callbacks whenever the popup is reopened or a
+-- weapon switch restarts the timer.
+local UI_AUTO_CLOSE_MS = 3000
+local uiCloseGeneration = 0
+
+local function ui_normalize_weapon_name(name)
+    if name == nil then return nil end
+    local n = tostring(name):lower()
+    n = n:gsub("^bp_", "")
+    n = n:gsub("pickup_c$", "")
+    n = n:gsub("pickup$", "")
+    n = n:gsub("_c$", "")
+    n = n:gsub("[^%w]", "")
+    return n
+end
+
+local function ui_uid_matches_weapon(uid, weaponName)
+    if uid == nil or weaponName == nil then return false end
+
+    local r = records[uid]
+    if r == nil then return false end
+
+    return ui_normalize_weapon_name(r.weapon) ==
+           ui_normalize_weapon_name(weaponName)
+end
+
+local function ui_promote_pending_for_active_weapon()
+    local container = uiActive.container
+    if container == nil then return false end
+
+    local pending = uiPendingEquipped[container]
+    if pending == nil or pending.uid == nil then return false end
+
+    -- A DB-backed name match is authoritative enough for the UI bridge.
+    if ui_uid_matches_weapon(pending.uid, uiActive.weapon) then
+        uiEquipped[container] = pending
+        uiPendingEquipped[container] = nil
+        return true
+    end
+
+    -- For a genuinely untracked weapon, allow the candidate only if we do not
+    -- already hold a DB-confirmed mapping for the current active weapon.
+    local current = uiEquipped[container]
+    if current == nil or
+       not ui_uid_matches_weapon(current.uid, uiActive.weapon)
+    then
+        if records[pending.uid] == nil then
+            uiEquipped[container] = pending
+            uiPendingEquipped[container] = nil
+            return true
+        end
+    end
+
+    return false
+end
+
+local function ui_cancel_auto_close()
+    uiCloseGeneration = uiCloseGeneration + 1
+end
+
+local function ui_arm_auto_close()
+    if UI == nil then return end
+
+    uiCloseGeneration = uiCloseGeneration + 1
+    local generation = uiCloseGeneration
+
+    ExecuteWithDelay(UI_AUTO_CLOSE_MS, function()
+        if generation ~= uiCloseGeneration then return end
+
+        ExecuteInGameThread(function()
+            if generation ~= uiCloseGeneration or UI == nil then return end
+
+            local okOpen, isOpen = pcall(function()
+                return UI.IsOpen()
+            end)
+
+            if okOpen and isOpen then
+                pcall(function()
+                    UI.Hide()
+                end)
+            end
+        end)
+    end)
+end
+
+local function ui_restart_auto_close_if_open()
+    if UI == nil then return end
+
+    local okOpen, isOpen = pcall(function()
+        return UI.IsOpen()
+    end)
+
+    if okOpen and isOpen then
+        ui_arm_auto_close()
+    end
+end
+
+local function ui_slot_tag_to_container(tag)
+    if tag == "Jig.PlayerSlot.PrimaryWeapon" then
+        return "CPrimary", true
+    elseif tag == "Jig.PlayerSlot.SecondaryWeapon" then
+        return "CSecondary", true
+    elseif tag == "Jig.PlayerSlot.SidearmWeapon" then
+        if uiEquipped.CPistol ~= nil then return "CPistol", true end
+        return "CSidearm", true
+    elseif tag == "Jig.PlayerSlot.MeleeWeapon" then
+        return "CMelee", false
+    end
+    return nil, false
+end
+
+local function ui_container_name(context)
+    local name = full_name(context)
+    for _, candidate in ipairs({"CPrimary", "CSecondary", "CPistol", "CSidearm", "CMelee"}) do
+        if name:find("." .. candidate .. ".", 1, true) ~= nil
+            or name:match("%." .. candidate .. "$") ~= nil
+        then
+            return candidate
+        end
+    end
+    return nil
+end
+
+local function ui_slot_uid(slot)
+    local raw = nil
+    local ok = pcall(function() raw = slot[FIELDS.item_unique_id] end)
+    if not ok or raw == nil then return nil end
+    return guid_to_string(raw)
+end
+
+local function ui_update_active_from_slot()
+    local container, firearm = ui_slot_tag_to_container(uiActive.slot_tag)
+    uiActive.container = container
+    uiActive.firearm = firearm
+    uiActive.uid = nil
+
+    if container ~= nil and uiEquipped[container] ~= nil then
+        uiActive.uid = uiEquipped[container].uid
+    end
+end
+
+local function ui_state_signature()
+    return table.concat({
+        tostring(uiActive.weapon),
+        tostring(uiActive.slot_tag),
+        tostring(uiActive.container),
+        tostring(uiActive.uid),
+        tostring(uiActive.firearm),
+    }, "|")
+end
+
+local function ui_log_state(reason)
+    local sig = ui_state_signature()
+    if sig == uiLastStateSignature then return end
+    uiLastStateSignature = sig
+    log("UI STATE | reason=" .. tostring(reason) ..
+        " | weapon=" .. tostring(uiActive.weapon) ..
+        " | slot=" .. tostring(uiActive.slot_tag) ..
+        " | container=" .. tostring(uiActive.container) ..
+        " | uid=" .. tostring(uiActive.uid) ..
+        " | firearm=" .. tostring(uiActive.firearm))
+end
+
+local function ui_refresh_if_open()
+    if UI == nil then return end
+    local okOpen, isOpen = pcall(function() return UI.IsOpen() end)
+    if okOpen and isOpen then
+        local okRefresh, err = pcall(function() UI.Refresh() end)
+        if not okRefresh then log("UI ERROR | refresh failed | " .. tostring(err)) end
+    end
+end
+
+local function ui_progression_state()
+    if uiActive.weapon == nil or uiActive.weapon == "" then
+        return { weapon = "No active weapon", status = "No progression data" }
+    end
+
+    if uiActive.container == "CMelee" or
+       uiActive.slot_tag == "Jig.PlayerSlot.MeleeWeapon" then
+        return { weapon = tostring(uiActive.weapon), status = "No firearm progression" }
+    end
+
+    if uiActive.uid == nil then
+        return { weapon = tostring(uiActive.weapon), status = "Resolving weapon..." }
+    end
+
+    local r = records[uiActive.uid]
+    if r == nil then
+        return {
+            weapon = tostring(uiActive.weapon),
+            level = 1,
+            xp_percent = 0,
+        }
+    end
+
+    local level = math.max(1, math.floor(tonumber(r.level) or 1))
+    local xpPercent = 0
+
+    if level >= Config.MaxLevel then
+        xpPercent = 100
+    else
+        local needed = xp_required(level)
+        if needed ~= nil and needed > 0 then
+            xpPercent = math.max(0, math.min(100,
+                ((tonumber(r.xp) or 0) / needed) * 100))
+        end
+    end
+
+    return {
+        weapon = tostring(r.weapon or uiActive.weapon or "Unknown"),
+        level = level,
+        xp_percent = xpPercent,
+    }
+end
+
+local function ui_scan_startup_candidates()
+    if uiActive.uid ~= nil or uiActive.weapon == nil then return false end
+
+    local okFind, slots = pcall(function() return FindAllOf(JSI_SLOT_CLASS) end)
+    if not okFind or slots == nil then return false end
+
+    local count = safe_array_length(slots)
+    if count == nil then pcall(function() count = #slots end) end
+    if count == nil or count == 0 then return false end
+
+    local target = ui_normalize_weapon_name(uiActive.weapon)
+    local matches = {}
+    local seenUid = {}
+
+    for i = 1, count do
+        local slot = nil
+        pcall(function() slot = slots[i] end)
+        if slot ~= nil then
+            local full = full_name(slot)
+            local container = nil
+
+            for _, candidate in ipairs({"CPrimary", "CSecondary", "CPistol", "CSidearm", "CMelee"}) do
+                local pattern = ""
+                -- Exact top-level JSI slot pattern used by the proven UIResearch
+                -- startup resolver. Build it here to avoid matching nested slots.
+                pattern = "%." .. candidate .. "%.WidgetTree_%d+%.JSI_Slot_C_%d+$"
+                if full:match(pattern) ~= nil then
+                    container = candidate
+                    break
+                end
+            end
+
+            if container ~= nil then
+                local uid = ui_slot_uid(slot)
+                if uid ~= nil and not seenUid[uid] then
+                    seenUid[uid] = true
+                    local r = records[uid]
+                    if r ~= nil and ui_normalize_weapon_name(r.weapon) == target then
+                        matches[#matches + 1] = {
+                            uid = uid,
+                            container = container,
+                            slot = slot,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    if #matches == 1 then
+        local m = matches[1]
+        uiEquipped[m.container] = { uid = m.uid, slot = m.slot }
+        uiActive.container = m.container
+        uiActive.uid = m.uid
+        uiActive.firearm = m.container ~= "CMelee"
+        ui_log_state("startup_scan")
+        return true
+    end
+
+    if #matches > 1 then
+        log("UI STARTUP | ambiguous equipped DB matches for " ..
+            tostring(uiActive.weapon) .. " | count=" .. tostring(#matches) ..
+            " | waiting for active slot callback")
+    end
+    return false
+end
+
+local function ui_on_get_active_weapon(Context, ActiveWeapon, ...)
+    local pickup = unwrap(ActiveWeapon)
+    local name = full_name(pickup):match("BP_([%w_]+)Pickup_C")
+
+    -- GetActiveWeapon briefly emits transient UObject wrappers during slot
+    -- transitions. Ignore anything that is not a real pickup Blueprint.
+    if name == nil or name == "" then return end
+
+    local changed = uiActive.weapon ~= name
+
+    uiActive.weapon = name
+
+    -- GetEquippedItemRef commonly fires before GetActiveWeapon during a switch.
+    -- Promote the queued candidate now that we know the new authoritative name.
+    ui_promote_pending_for_active_weapon()
+    ui_update_active_from_slot()
+
+    ui_log_state("active_weapon")
+    ui_refresh_if_open()
+
+    -- Weapon switches turn the panel into a fresh 3-second popup. Routine
+    -- repeated GetActiveWeapon callbacks do not extend its lifetime.
+    if changed then
+        ui_restart_auto_close_if_open()
+    end
+end
+
+local function ui_on_get_active_weapon_slot(Context, SlotTag, ...)
+    local raw = unwrap(SlotTag)
+    local tag = decode_gameplay_tag(raw)
+    if tag == nil then return end
+
+    local previousTag = uiActive.slot_tag
+
+    if tag == "None" then
+        uiActive.slot_tag = nil
+        uiActive.container = nil
+        uiActive.uid = nil
+        uiActive.firearm = false
+    else
+        uiActive.slot_tag = tag
+        ui_update_active_from_slot()
+    end
+
+    ui_log_state("active_slot")
+    ui_refresh_if_open()
+
+    -- A real slot change is a weapon switch, so reset popup lifetime.
+    -- Ignore the transient None phase; the real destination tag will follow.
+    if tag ~= "None" and tag ~= previousTag then
+        ui_restart_auto_close_if_open()
+    end
+end
+
+local function ui_on_get_equipped_item_ref(Context, Found, ItemRef, IsPending, ...)
+    local found = unwrap(Found)
+    local slot = unwrap(ItemRef)
+    if found ~= true or slot == nil then return end
+
+    local container = ui_container_name(Context)
+    if container == nil then return end
+
+    local uid = ui_slot_uid(slot)
+    if uid == nil then return end
+
+    local candidate = { uid = uid, slot = slot }
+    local isActiveContainer = container == uiActive.container
+
+    if isActiveContainer then
+        -- During combat SurrounDead can expose alternate/stub JSI slots for the
+        -- same container. Never replace a known-good DB-backed active UID with
+        -- an unrelated candidate. Queue it until GetActiveWeapon confirms the
+        -- new weapon name during an actual switch.
+        if ui_uid_matches_weapon(uid, uiActive.weapon) then
+            uiEquipped[container] = candidate
+            uiPendingEquipped[container] = nil
+        else
+            local current = uiEquipped[container]
+
+            if current ~= nil and
+               ui_uid_matches_weapon(current.uid, uiActive.weapon)
+            then
+                uiPendingEquipped[container] = candidate
+            else
+                -- No confirmed mapping yet. Preserve the candidate so the
+                -- following active-weapon callback can validate/promote it.
+                uiPendingEquipped[container] = candidate
+
+                if uiActive.weapon == nil or records[uid] == nil then
+                    uiEquipped[container] = candidate
+                end
+            end
+        end
+    else
+        -- Non-active containers can be cached freely for the next switch.
+        uiEquipped[container] = candidate
+        uiPendingEquipped[container] = nil
+    end
+
+    local sig = tostring(uid)
+    if uiLastEquippedSignature[container] ~= sig then
+        uiLastEquippedSignature[container] = sig
+        log("UI EQUIPPED | container=" .. tostring(container) .. " | uid=" .. tostring(uid))
+    end
+
+    ui_update_active_from_slot()
+    ui_log_state("equipped")
+    ui_refresh_if_open()
+
+    -- Deliberately do NOT restart auto-close here. GetEquippedItemRef can fire
+    -- during combat and inventory maintenance; only actual weapon switches
+    -- extend the popup lifetime.
+end
+
+if UI ~= nil then
+    local okConfig, configErr = pcall(function()
+        UI.Configure({
+            title = "WEAPON PROGRESSION",
+            x = 92,
+            y = 250,
+            width = 356,
+            height = 172,
+            z_order = 200,
+        })
+
+        UI.SetProvider(ui_progression_state)
+    end)
+
+    if not okConfig then
+        log("UI MODULE DISABLED | configure/provider failed | " .. tostring(configErr))
+        UI = nil
+    end
+end
+
+local function ui_toggle()
+    if UI == nil then
+        log("UI ERROR | ui.lua is not loaded")
+        return
+    end
+
+    local okOpen, isOpen = pcall(function() return UI.IsOpen() end)
+
+    if okOpen and isOpen then
+        -- Manual close invalidates any delayed auto-close callback.
+        ui_cancel_auto_close()
+
+        local okHide, hideErr = pcall(function()
+            UI.Hide()
+        end)
+
+        if not okHide then
+            log("UI ERROR | F8 close failed | " .. tostring(hideErr))
+        end
+        return
+    end
+
+    if uiActive.uid == nil then
+        ui_scan_startup_candidates()
+    end
+
+    local okShow, showErr = pcall(function()
+        UI.Show()
+    end)
+
+    if not okShow then
+        log("UI ERROR | F8 open failed | " .. tostring(showErr))
+        return
+    end
+
+    ui_arm_auto_close()
+end
+
+-- ============================================================================
 -- Persistence - data.db v2
 -- ============================================================================
 
@@ -1356,6 +1895,9 @@ local function award_kill(uid, weaponName, vanillaXP)
     else
         log(string.format("KILL XP | %s | %s | vanilla=%.3f | multiplier=%.3fx | weapon_xp=%.3f | L%d %.3f/%d | kills=%d | saved=%s",r.weapon,uid,vanillaXP,Config.WeaponXPMultiplier,weaponXP,r.level,r.xp,xp_required(r.level),r.kills,tostring(saved)))
     end
+
+    -- If this is the weapon currently displayed, update Level / XP immediately.
+    if uiActive.uid == uid then ui_refresh_if_open() end
 end
 
 -- ============================================================================
@@ -1946,6 +2488,9 @@ end
 
 local hooks = {
     {"GET_EQUIPMENT_UID", PATH_GET_EQUIPMENT_UID, on_get_equipment_uid},
+    {"GET_ACTIVE_WEAPON", PATH_GET_ACTIVE_WEAPON, ui_on_get_active_weapon},
+    {"GET_ACTIVE_SLOT",   PATH_GET_ACTIVE_WEAPON_SLOT, ui_on_get_active_weapon_slot},
+    {"GET_EQUIPPED_REF",  PATH_GET_EQUIPPED_ITEM_REF, ui_on_get_equipped_item_ref},
     {"JIG_TRY_ADD",       PATH_JIG_TRY_ADD,       on_inventory_add_cache_invalidate},
     {"TOOLTIP_UPDATE",    PATH_TOOLTIP_UPDATE,    on_tooltip_update},
     {"STAT_W_CONSTRUCT",  PATH_STAT_W_CONSTRUCT,  on_stat_w_construct},
@@ -2018,16 +2563,33 @@ end
 
 log("----------------------------------------------------------------")
 log("WeaponProgression v" .. VERSION)
-log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; utility safeguards v0.15.1 ACTIVE.")
+log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; v0.15.1 utility safeguards retained.")
 log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native SurrounDead notification UI. STAT VERIFY DEBOUNCE active.")
 log("data.db v2 is authoritative for base stats + earned upgrades; previous snapshot retained as data.db.bak.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
 log("NATIVE TOOLTIP ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
+log("REUSABLE NATIVE UI ACTIVE | compact native status card | XP bar | 3s auto-close reset by weapon switch.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())
 load_config()
 load_db()
+
+if UI ~= nil then
+    local okKeybind, keybindErr = pcall(function()
+        RegisterKeyBind(Key.F8, function()
+            ExecuteInGameThread(function()
+                ui_toggle()
+            end)
+        end)
+    end)
+
+    if okKeybind then
+        log("UI KEYBIND | F8 registered")
+    else
+        log("UI KEYBIND FAILED | " .. tostring(keybindErr))
+    end
+end
 
 -- Blueprint classes are not available when the Lua mod first starts.
 ExecuteWithDelay(3000, try_register_hooks)
