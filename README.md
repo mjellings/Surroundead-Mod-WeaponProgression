@@ -338,18 +338,17 @@ The intention is to keep this repository focused on the actual WeaponProgression
 
 ---
 
-## Disclaimer
-
-WeaponProgression is an unofficial community mod and is not affiliated with or endorsed by the developer or publisher of SurrounDead.
-
-SurrounDead and its associated names and assets belong to their respective owners.
-
-This project does not distribute SurrounDead game assets.
-
----
-
 ## License
 
-A licence has not yet been selected.
+**WeaponProgression — GPL-3.0**  
+Copyright © 2026 Matt Jellings
 
-Until one is added, please do not assume that the absence of a licence grants permission to redistribute or incorporate the source into other projects.
+WeaponProgression is free and open-source software licensed under the GNU General Public License v3.0.
+
+You may use, modify and redistribute the mod in accordance with the GPL-3.0 licence. Modified versions distributed to others must retain the applicable licence notices and source-code obligations.
+
+The full licence text is included in [`LICENSE`](LICENSE).
+
+SurrounDead and associated assets are property of their respective owners. This project is unofficial and is not affiliated with or endorsed by the developers of SurrounDead.
+
+This project does not distribute SurrounDead game assets.
