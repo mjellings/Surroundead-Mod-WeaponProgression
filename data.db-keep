@@ -1,0 +1,5 @@
+# WeaponProgression data.db v2
+# uid\tlevel\txp\tkills\tweapon\tlast_upgrade\tbase_damage\tup_damage\tbase_critmult\tup_critmult\tbase_critchance\tup_critchance\tbase_rpm\tup_rpm\tbase_falloff\tup_falloff\tpending_rewards
+14BD19F5-46AD-9CD3-BD8D-9F9B9CD90C25	3	63.3689384698868	11	HK416	critmult	49	0	15	1	6	0	842	1	51	0	0
+18E57E18-40C7-D733-8CFD-17B43F84391A	1	93.6652421593666	4	BattleReadyGlock		32	0	30	0	21	0	1161	0	33	0	0
+19BB6DEF-481C-1781-72EF-62A20CFED911	5	15.3533013030886	38	Crusher	damage	57	1	25	0	16	2	617	0	118	1	0

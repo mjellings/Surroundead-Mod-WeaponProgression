@@ -1,4 +1,4 @@
--- WeaponProgression v0.16.0-dev1 - Reusable native UI integration
+-- WeaponProgression v0.17.0-dev1 - Configurable mastery milestones
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Development build based on the proven v0.15.1 progression + utility core.
@@ -59,10 +59,11 @@
 --   v0.16.0-dev1 - Reusable ui.lua panel integrated; F8 shows live held-weapon Level / XP using active slot -> physical UID mapping.
 --   v0.16.0-dev2 - Stabilise active UI UID during combat callbacks; auto-close panel after 3s and reset timer on weapon switch.
 --   v0.16.0-dev3 - Compact native-style status card with aligned stats, divider and native UMG XP progress bar.
+--   v0.17.0-dev1 - Configurable mastery milestones/ranks, deterministic milestone bonuses, cumulative caps, tooltip + F8 rank/next-rank UI.
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.16.0-dev3"
+local VERSION = "0.17.0-dev1"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -119,6 +120,24 @@ end
 local DB_PATHS = candidate_paths("data.db")
 local CONFIG_PATHS = candidate_paths("config.ini")
 
+local DEFAULT_MILESTONES = {
+    { level=5,  rank="Proven I",      bonus_type="DamagePercent",             value=2.0 },
+    { level=10, rank="Proven II",     bonus_type="FalloffPercent",            value=3.0 },
+    { level=15, rank="Proven III",    bonus_type="CriticalMultiplierPoints",  value=2.0 },
+    { level=20, rank="Trusted I",     bonus_type="RPMPercent",                value=3.0, fallback_type="FalloffPercent" },
+    { level=25, rank="Trusted II",    bonus_type="CriticalChancePoints",      value=1.0 },
+    { level=30, rank="Trusted III",   bonus_type="DamagePercent",             value=3.0 },
+    { level=35, rank="Veteran I",     bonus_type="FalloffPercent",            value=4.0 },
+    { level=40, rank="Veteran II",    bonus_type="RPMPercent",                value=4.0, fallback_type="FalloffPercent" },
+    { level=45, rank="Veteran III",   bonus_type="CriticalMultiplierPoints",  value=2.0 },
+    { level=50, rank="Elite I",       bonus_type="DamagePercent",             value=4.0 },
+    { level=55, rank="Elite II",      bonus_type="CriticalChancePoints",      value=2.0 },
+    { level=60, rank="Elite III",     bonus_type="FalloffPercent",            value=5.0 },
+    { level=65, rank="Signature I",   bonus_type="RPMPercent",                value=5.0, fallback_type="FalloffPercent" },
+    { level=70, rank="Signature II",  bonus_type="DamagePercent",             value=5.0 },
+    { level=75, rank="Signature III", bonus_type="CriticalMultiplierPoints",  value=3.0 },
+}
+
 local DEFAULT_CONFIG = {
     WeaponXPMultiplier = 1.0,
     BaseLevelXP = 100,
@@ -131,7 +150,28 @@ local DEFAULT_CONFIG = {
     FalloffPercent = 2.0,
     PreventConsecutiveSameStat = true,
     VerboseLogging = false,
+
+    MilestonesEnabled = true,
+    CapDamagePercent = 30.0,
+    CapRPMPercent = 25.0,
+    CapFalloffPercent = 25.0,
+    CapCriticalChancePoints = 15.0,
+    CapCriticalMultiplierPoints = 20.0,
 }
+
+local function copy_milestones(source)
+    local out = {}
+    for _, m in ipairs(source or {}) do
+        out[#out + 1] = {
+            level = m.level,
+            rank = m.rank,
+            bonus_type = m.bonus_type,
+            value = m.value,
+            fallback_type = m.fallback_type,
+        }
+    end
+    return out
+end
 
 local Config = {
     WeaponXPMultiplier = DEFAULT_CONFIG.WeaponXPMultiplier,
@@ -145,7 +185,16 @@ local Config = {
     FalloffPercent = DEFAULT_CONFIG.FalloffPercent,
     PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat,
     VerboseLogging = DEFAULT_CONFIG.VerboseLogging,
+
+    MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled,
+    CapDamagePercent = DEFAULT_CONFIG.CapDamagePercent,
+    CapRPMPercent = DEFAULT_CONFIG.CapRPMPercent,
+    CapFalloffPercent = DEFAULT_CONFIG.CapFalloffPercent,
+    CapCriticalChancePoints = DEFAULT_CONFIG.CapCriticalChancePoints,
+    CapCriticalMultiplierPoints = DEFAULT_CONFIG.CapCriticalMultiplierPoints,
+
     LevelThresholds = {},
+    Milestones = copy_milestones(DEFAULT_MILESTONES),
 }
 
 local STAT_DEFS = {
@@ -158,6 +207,22 @@ local STAT_DEFS = {
 
 local STAT_BY_TAG = {}
 for _, def in ipairs(STAT_DEFS) do STAT_BY_TAG[def.tag] = def end
+
+local MILESTONE_BONUS_TYPES = {
+    DamagePercent = { stat_key="damage", mode="percent", label="Damage" },
+    CriticalChancePoints = { stat_key="critchance", mode="points", label="Critical Chance" },
+    CriticalMultiplierPoints = { stat_key="critmult", mode="points", label="Critical Multiplier" },
+    RPMPercent = { stat_key="rpm", mode="percent", label="RPM" },
+    FalloffPercent = { stat_key="falloff", mode="percent", label="Damage Falloff" },
+}
+
+local CAP_CONFIG_BY_STAT = {
+    damage = "CapDamagePercent",
+    critchance = "CapCriticalChancePoints",
+    critmult = "CapCriticalMultiplierPoints",
+    rpm = "CapRPMPercent",
+    falloff = "CapFalloffPercent",
+}
 
 local RETRY_DELAY_MS = 3000
 local MAX_RETRY_ROUNDS = 40
@@ -178,6 +243,7 @@ local liveWeapons = {}
 local save_db = nil
 local reconcile_weapon_stats = nil
 local process_pending_rewards = nil
+local stat_target = nil
 local cachedJigComponent = nil
 
 local QUIET_LOG_PREFIXES = {
@@ -798,19 +864,19 @@ scan_live_jsi_slots = function(reason, targetUid, targetWeapon, targetUidStruct)
                 local base = r.bases[def.key]
                 local upgradeCount = r.upgrades[def.key] or 0
                 local liveStat = statMap[def.tag]
-                if base ~= nil and upgradeCount > 0 and liveStat ~= nil then
-                    local target
-                    if def.mode == "percent" then
-                        target = base * ((1.0 + (Config[def.config] / 100.0)) ^ math.max(0, math.floor(tonumber(upgradeCount) or 0)))
+                if base ~= nil and liveStat ~= nil then
+                    local target = stat_target and stat_target(def, base, upgradeCount, r) or nil
+                    if target == nil then
+                        log("STAT VERIFY SKIP | " .. tostring(targetWeapon) .. " | " .. tostring(targetUid) ..
+                            " | " .. tostring(def.tag) .. " | target unavailable")
                     else
-                        target = base + (Config[def.config] * math.max(0, math.floor(tonumber(upgradeCount) or 0)))
-                    end
-                    local tolerance = math.max(0.0001, math.abs(target) * 0.000001)
-                    if math.abs(liveStat.value - target) <= tolerance then
-                        log(string.format("STAT VERIFY OK | %s | %s | %s | live=%.6g | target=%.6g", targetWeapon,targetUid,def.tag,liveStat.value,target))
-                    else
-                        mismatches = mismatches + 1
-                        log(string.format("STAT VERIFY MISMATCH | %s | %s | %s | live=%.6g | target=%.6g | no_retry_until_next_real_resolution", targetWeapon,targetUid,def.tag,liveStat.value,target))
+                        local tolerance = math.max(0.0001, math.abs(target) * 0.000001)
+                        if math.abs(liveStat.value - target) <= tolerance then
+                            log(string.format("STAT VERIFY OK | %s | %s | %s | live=%.6g | target=%.6g", targetWeapon,targetUid,def.tag,liveStat.value,target))
+                        else
+                            mismatches = mismatches + 1
+                            log(string.format("STAT VERIFY MISMATCH | %s | %s | %s | live=%.6g | target=%.6g | no_retry_until_next_real_resolution", targetWeapon,targetUid,def.tag,liveStat.value,target))
+                        end
                     end
                 end
             end
@@ -871,7 +937,16 @@ local function reset_config()
     Config.FalloffPercent = DEFAULT_CONFIG.FalloffPercent
     Config.PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat
     Config.VerboseLogging = DEFAULT_CONFIG.VerboseLogging
+
+    Config.MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled
+    Config.CapDamagePercent = DEFAULT_CONFIG.CapDamagePercent
+    Config.CapRPMPercent = DEFAULT_CONFIG.CapRPMPercent
+    Config.CapFalloffPercent = DEFAULT_CONFIG.CapFalloffPercent
+    Config.CapCriticalChancePoints = DEFAULT_CONFIG.CapCriticalChancePoints
+    Config.CapCriticalMultiplierPoints = DEFAULT_CONFIG.CapCriticalMultiplierPoints
+
     Config.LevelThresholds = {}
+    Config.Milestones = copy_milestones(DEFAULT_MILESTONES)
 end
 
 local function find_config_file()
@@ -936,6 +1011,111 @@ local function set_stat_upgrade_value(key, rawValue)
     end
 end
 
+
+local function parse_bool(rawValue)
+    local b = trim(rawValue):lower()
+    if b == "true" or b == "1" or b == "yes" or b == "on" then return true end
+    if b == "false" or b == "0" or b == "no" or b == "off" then return false end
+    return nil
+end
+
+local function set_cap_value(key, rawValue)
+    local n = tonumber(trim(rawValue))
+    if n == nil or n < 0 then
+        log("CONFIG WARNING | ignored invalid cap " .. tostring(key) .. "=" .. tostring(rawValue))
+        return
+    end
+
+    if key == "DamagePercent" then Config.CapDamagePercent = n
+    elseif key == "RPMPercent" then Config.CapRPMPercent = n
+    elseif key == "FalloffPercent" then Config.CapFalloffPercent = n
+    elseif key == "CriticalChancePoints" then Config.CapCriticalChancePoints = n
+    elseif key == "CriticalMultiplierPoints" then Config.CapCriticalMultiplierPoints = n
+    else
+        log("CONFIG WARNING | ignored unknown cap " .. tostring(key))
+    end
+end
+
+local function remove_milestone_level(level)
+    for i = #Config.Milestones, 1, -1 do
+        if Config.Milestones[i].level == level then
+            table.remove(Config.Milestones, i)
+        end
+    end
+end
+
+local function set_milestone_value(key, rawValue)
+    if key == "Enabled" then
+        local b = parse_bool(rawValue)
+        if b == nil then
+            log("CONFIG WARNING | ignored invalid boolean Milestones.Enabled=" .. tostring(rawValue))
+        else
+            Config.MilestonesEnabled = b
+        end
+        return
+    end
+
+    local level = tonumber(tostring(key):match("^Level(%d+)$"))
+    if level == nil or level < 1 then
+        log("CONFIG WARNING | ignored invalid milestone key " .. tostring(key))
+        return
+    end
+    level = math.floor(level)
+
+    local raw = trim(rawValue)
+    if raw:lower() == "disabled" or raw:lower() == "off" or raw:lower() == "none" then
+        remove_milestone_level(level)
+        return
+    end
+
+    local parts = {}
+    for part in (raw .. "|"):gmatch("(.-)|") do
+        parts[#parts + 1] = trim(part)
+    end
+
+    local rank = parts[1] or ""
+    local bonusType = parts[2] or ""
+    local value = tonumber(parts[3])
+    local fallbackType = parts[4]
+    if fallbackType == "" then fallbackType = nil end
+
+    if rank == "" then
+        log("CONFIG WARNING | milestone Level" .. tostring(level) .. " has empty rank name")
+        return
+    end
+    if MILESTONE_BONUS_TYPES[bonusType] == nil then
+        log("CONFIG WARNING | milestone Level" .. tostring(level) ..
+            " uses unsupported bonus type " .. tostring(bonusType))
+        return
+    end
+    if value == nil or value < 0 then
+        log("CONFIG WARNING | milestone Level" .. tostring(level) ..
+            " has invalid value " .. tostring(parts[3]))
+        return
+    end
+    if fallbackType ~= nil and MILESTONE_BONUS_TYPES[fallbackType] == nil then
+        log("CONFIG WARNING | milestone Level" .. tostring(level) ..
+            " uses unsupported fallback type " .. tostring(fallbackType))
+        return
+    end
+
+    remove_milestone_level(level)
+    Config.Milestones[#Config.Milestones + 1] = {
+        level = level,
+        rank = rank,
+        bonus_type = bonusType,
+        value = value,
+        fallback_type = fallbackType,
+    }
+end
+
+local function sort_milestones()
+    table.sort(Config.Milestones, function(a, b)
+        if a.level == b.level then return tostring(a.rank) < tostring(b.rank) end
+        return a.level < b.level
+    end)
+end
+
 local function load_config()
     reset_config()
     configPath = find_config_file()
@@ -980,14 +1160,18 @@ local function load_config()
                         set_stat_upgrade_value(key, value)
 
                     elseif section == "Utility" and key == "VerboseLogging" then
-                        local b = value:lower()
-                        if b == "true" or b == "1" or b == "yes" or b == "on" then
-                            Config.VerboseLogging = true
-                        elseif b == "false" or b == "0" or b == "no" or b == "off" then
-                            Config.VerboseLogging = false
-                        else
+                        local b = parse_bool(value)
+                        if b == nil then
                             log("CONFIG WARNING | ignored invalid boolean VerboseLogging=" .. tostring(value))
+                        else
+                            Config.VerboseLogging = b
                         end
+
+                    elseif section == "Caps" then
+                        set_cap_value(key, value)
+
+                    elseif section == "Milestones" then
+                        set_milestone_value(key, value)
 
                     elseif section == "LevelThresholds" then
                         local targetLevel = tonumber(key:match("^Level(%d+)$"))
@@ -1008,6 +1192,7 @@ local function load_config()
     end
 
     f:close()
+    sort_milestones()
 
     local overrideCount = 0
     for _ in pairs(Config.LevelThresholds) do overrideCount = overrideCount + 1 end
@@ -1028,6 +1213,22 @@ local function load_config()
         Config.RPMPercent, Config.FalloffPercent, tostring(Config.PreventConsecutiveSameStat)
     ))
     log("UTILITY CONFIG | verbose_logging=" .. tostring(Config.VerboseLogging))
+    log(string.format(
+        "CAPS | damage=+%.3f%% | crit_chance=+%.3f | crit_mult=+%.3f | rpm=+%.3f%% | falloff=+%.3f%%",
+        Config.CapDamagePercent, Config.CapCriticalChancePoints,
+        Config.CapCriticalMultiplierPoints, Config.CapRPMPercent,
+        Config.CapFalloffPercent
+    ))
+    log("MILESTONES | enabled=" .. tostring(Config.MilestonesEnabled) ..
+        " | configured=" .. tostring(#Config.Milestones))
+
+    for _, m in ipairs(Config.Milestones) do
+        log("MILESTONE CONFIG | L" .. tostring(m.level) ..
+            " | " .. tostring(m.rank) ..
+            " | " .. tostring(m.bonus_type) ..
+            "=" .. tostring(m.value) ..
+            (m.fallback_type and (" | fallback=" .. tostring(m.fallback_type)) or ""))
+    end
 
     if overrideCount > 0 then
         local levels = {}
@@ -1061,6 +1262,79 @@ local function xp_required(currentLevel)
     end
 
     return Config.BaseLevelXP + ((currentLevel - 1) * Config.XPIncreasePerLevel)
+end
+
+
+local function get_rank_info(level)
+    level = math.max(1, math.floor(tonumber(level) or 1))
+    if not Config.MilestonesEnabled then
+        return nil, nil
+    end
+
+    local current = nil
+    local nextRank = nil
+    for _, m in ipairs(Config.Milestones or {}) do
+        if m.level <= level then
+            current = m
+        elseif nextRank == nil then
+            nextRank = m
+            break
+        end
+    end
+    return current, nextRank
+end
+
+local function resolved_milestone_type_for_record(m, r)
+    if m == nil or r == nil then return nil end
+    r.bases = r.bases or {}
+
+    local primary = MILESTONE_BONUS_TYPES[m.bonus_type]
+    if primary ~= nil and r.bases[primary.stat_key] ~= nil then
+        return m.bonus_type
+    end
+
+    if m.fallback_type ~= nil then
+        local fallback = MILESTONE_BONUS_TYPES[m.fallback_type]
+        if fallback ~= nil and r.bases[fallback.stat_key] ~= nil then
+            return m.fallback_type
+        end
+    end
+
+    return nil
+end
+
+local function milestone_bonus_for_stat(r, def)
+    if not Config.MilestonesEnabled or r == nil or def == nil then return 0 end
+    local level = math.max(1, math.floor(tonumber(r.level) or 1))
+    local total = 0
+
+    for _, m in ipairs(Config.Milestones or {}) do
+        if m.level > level then break end
+        local resolvedType = resolved_milestone_type_for_record(m, r)
+        local meta = resolvedType and MILESTONE_BONUS_TYPES[resolvedType] or nil
+        if meta ~= nil and meta.stat_key == def.key then
+            total = total + (tonumber(m.value) or 0)
+        end
+    end
+
+    return total
+end
+
+local function milestone_bonus_description(m, r)
+    if m == nil then return nil end
+    local resolvedType = resolved_milestone_type_for_record(m, r)
+    local meta = resolvedType and MILESTONE_BONUS_TYPES[resolvedType] or nil
+    if meta == nil then return "No applicable stat bonus" end
+
+    local value = tonumber(m.value) or 0
+    local rendered = (math.abs(value - math.floor(value + 0.5)) < 0.000001)
+        and tostring(math.floor(value + 0.5))
+        or string.format("%.1f", value):gsub("0+$", ""):gsub("%.$", "")
+
+    if meta.mode == "percent" then
+        return meta.label .. " +" .. rendered .. "%"
+    end
+    return meta.label .. " +" .. rendered
 end
 
 -- ============================================================================
@@ -1301,10 +1575,16 @@ local function ui_progression_state()
         end
     end
 
+    local currentRank, nextRank = get_rank_info(level)
+
     return {
         weapon = tostring(r.weapon or uiActive.weapon or "Unknown"),
         level = level,
         xp_percent = xpPercent,
+        rank = currentRank and tostring(currentRank.rank) or nil,
+        next_rank = nextRank and tostring(nextRank.rank) or nil,
+        next_level = nextRank and tonumber(nextRank.level) or nil,
+        next_bonus = nextRank and milestone_bonus_description(nextRank, r) or nil,
     }
 end
 
@@ -1496,7 +1776,7 @@ if UI ~= nil then
             x = 92,
             y = 250,
             width = 356,
-            height = 172,
+            height = 228,
             z_order = 200,
         })
 
@@ -1701,12 +1981,37 @@ end
 -- Weapon progression + persistent stat upgrades
 -- ============================================================================
 
-local function stat_target(def, base, upgradeCount)
+stat_target = function(def, base, upgradeCount, record)
     upgradeCount = math.max(0, math.floor(tonumber(upgradeCount) or 0))
+    base = tonumber(base)
+    if base == nil then return nil end
+
+    local milestoneBonus = milestone_bonus_for_stat(record, def)
+    local target
+
     if def.mode == "percent" then
-        return base * ((1.0 + (Config[def.config] / 100.0)) ^ upgradeCount)
+        -- Preserve the proven per-level progression formula exactly, then add
+        -- milestone percentage as a predictable contribution from captured base.
+        -- This avoids compounding milestone rewards on already-modified live values.
+        local normalTarget = base * ((1.0 + (Config[def.config] / 100.0)) ^ upgradeCount)
+        target = normalTarget + (base * (milestoneBonus / 100.0))
+
+        local capKey = CAP_CONFIG_BY_STAT[def.key]
+        local capPercent = capKey and tonumber(Config[capKey]) or nil
+        if capPercent ~= nil then
+            target = math.min(target, base * (1.0 + (capPercent / 100.0)))
+        end
+    else
+        target = base + (Config[def.config] * upgradeCount) + milestoneBonus
+
+        local capKey = CAP_CONFIG_BY_STAT[def.key]
+        local capPoints = capKey and tonumber(Config[capKey]) or nil
+        if capPoints ~= nil then
+            target = math.min(target, base + capPoints)
+        end
     end
-    return base + (Config[def.config] * upgradeCount)
+
+    return target
 end
 
 local function approximately_equal(a,b)
@@ -1779,8 +2084,8 @@ reconcile_weapon_stats = function(uid, weaponName, reason)
         local base=r.bases[def.key]
         local count=r.upgrades[def.key] or 0
         local liveStat=live.stats[def.tag]
-        if base ~= nil and count > 0 and liveStat ~= nil then
-            local target=stat_target(def,base,count)
+        if base ~= nil and liveStat ~= nil then
+            local target=stat_target(def,base,count,r)
             if not approximately_equal(liveStat.value,target) then
                 if apply_stat_target(uid,weaponName or r.weapon,def,target,"reapply:" .. tostring(reason)) then changed=true end
             end
@@ -1825,7 +2130,7 @@ local function award_stat_upgrade(uid, weaponName, newLevel)
     r.upgrades[def.key]=(r.upgrades[def.key] or 0)+1
     r.last_upgrade=def.key
     local base=r.bases[def.key]
-    local target=stat_target(def,base,r.upgrades[def.key])
+    local target=stat_target(def,base,r.upgrades[def.key],r)
 
     -- Persist the earned reward BEFORE attempting the runtime write. A failed
     -- persistence write must never create a live-only upgrade that disappears
@@ -1882,7 +2187,27 @@ local function award_kill(uid, weaponName, vanillaXP)
             r.xp=r.xp-needed
             r.level=r.level+1
             log(string.format("LEVEL UP | %s | %s | consumed=%d XP | new_level=%d | overflow=%.3f",r.weapon,uid,needed,r.level,r.xp))
+
+            local rankAtLevel = nil
+            if Config.MilestonesEnabled then
+                for _, m in ipairs(Config.Milestones or {}) do
+                    if m.level == r.level then rankAtLevel = m; break end
+                end
+            end
+            if rankAtLevel ~= nil then
+                log("MILESTONE REACHED | " .. tostring(r.weapon) .. " | " .. tostring(uid) ..
+                    " | L" .. tostring(r.level) .. " | " .. tostring(rankAtLevel.rank) ..
+                    " | " .. tostring(milestone_bonus_description(rankAtLevel, r)))
+            end
+
             award_stat_upgrade(uid,r.weapon,r.level)
+
+            -- A milestone can affect a different stat from the normal random
+            -- level reward. Reconcile the whole live weapon immediately so
+            -- every deterministic milestone contribution is visible at once.
+            if rankAtLevel ~= nil and reconcile_weapon_stats ~= nil then
+                reconcile_weapon_stats(uid, r.weapon, "milestone_level_up")
+            end
         end
         if r.level >= Config.MaxLevel then r.xp=0 end
     else
@@ -2181,10 +2506,18 @@ local function add_progression_rows(tooltip, r, weaponName)
     if needed ~= nil and needed > 0 then
         xpPercent = math.max(0, math.min(100, (xp / needed) * 100))
     end
+    local currentRank, nextRank = get_rank_info(r.level or 1)
+    local nextText = "MAX"
+    if nextRank ~= nil then
+        nextText = tostring(nextRank.rank) .. " @ L" .. tostring(nextRank.level)
+    end
+
     local rows = {
         { label="Level", value=tostring(math.floor(r.level or 1)), row=1, col=1 },
         { label="XP", value=display_number(xpPercent) .. "%", row=2, col=0 },
         { label="Kills", value=tostring(math.floor(r.kills or 0)), row=2, col=1 },
+        { label="Rank", value=currentRank and tostring(currentRank.rank) or "Unranked", row=3, col=0 },
+        { label="Next", value=nextText, row=3, col=1 },
     }
 
     for _, info in ipairs(rows) do
@@ -2320,7 +2653,7 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
             local count = math.floor(tonumber(r.upgrades[def.key]) or 0)
             local live = liveStats[def.tag]
             if base ~= nil then
-                local target = stat_target(def, base, count)
+                local target = stat_target(def, base, count, r)
                 local bonus = (target ~= nil) and (target - base) or 0
                 log(string.format(
                     "TOOLTIP STAT | %s | %s | base=%.3f | live=%s | target=%s | bonus=%+.3f | upgrades=%d",
@@ -2329,7 +2662,7 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
                     target ~= nil and string.format("%.3f", target) or "<nil>",
                     bonus, count
                 ))
-                if count > 0 and target ~= nil and math.abs(bonus) >= 0.000001 then
+                if target ~= nil and math.abs(bonus) >= 0.000001 then
                     parts[#parts + 1] = string.format("%s %+0.3f", def.tag, bonus)
                     tooltipBonusContext.by_tag[def.tag] = bonus
                 end
@@ -2568,7 +2901,8 @@ log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native
 log("data.db v2 is authoritative for base stats + earned upgrades; previous snapshot retained as data.db.bak.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
 log("NATIVE TOOLTIP ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
-log("REUSABLE NATIVE UI ACTIVE | compact native status card | XP bar | 3s auto-close reset by weapon switch.")
+log("REUSABLE NATIVE UI ACTIVE | mastery rank + next milestone | XP bar | 3s auto-close reset by weapon switch.")
+log("MASTERY MILESTONES ACTIVE | config.ini-driven fixed bonuses + cumulative caps | deterministic reconstruction from weapon level.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())

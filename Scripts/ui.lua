@@ -1,6 +1,6 @@
 -- ============================================================================
 -- WeaponProgression UI module
--- v0.16.0-dev3 native status-card layout
+-- v0.17.0-dev1 mastery milestone status-card layout
 -- Presentation only: no gameplay hooks, GUID logic, DB access or XP formulas.
 -- ============================================================================
 
@@ -9,7 +9,7 @@ local PREFIX = "[WeaponProgression.UI] "
 
 local config = {
     title = "WEAPON PROGRESSION",
-    x = 92.0, y = 250.0, width = 356.0, height = 172.0, z_order = 200,
+    x = 92.0, y = 250.0, width = 356.0, height = 228.0, z_order = 200,
 
     outer_colour      = { R=0.18, G=0.18, B=0.18, A=0.95 },
     background_colour = { R=0.035, G=0.035, B=0.035, A=0.94 },
@@ -21,17 +21,21 @@ local config = {
 
     title_size = 13,
     weapon_size = 23,
+    rank_size = 14,
     label_size = 14,
     value_size = 16,
+    next_size = 12,
 }
 
 local runtime = {
     root=nil, tree=nil, canvas=nil, outer=nil, inner=nil, content=nil,
     refs={
-        title=nil, weapon=nil,
+        title=nil, weapon=nil, rank=nil,
         level_label=nil, level_value=nil,
         xp_label=nil, xp_value=nil,
-        xp_bar=nil, status=nil,
+        xp_bar=nil,
+        next_label=nil, next_value=nil, next_bonus=nil,
+        status=nil,
     },
     provider=nil, state=nil, rendered={}, serial=0,
 }
@@ -275,33 +279,39 @@ local function build()
         16, 31, 318, 32
     )
 
+    local rank = make_text_block(
+        content, suffix, "Rank", "UNRANKED",
+        config.rank_size, config.muted_text_colour,
+        16, 61, 318, 20
+    )
+
     local divider = make_border(
         content, suffix, "Divider", config.divider_colour,
-        16, 67, 322, 1
+        16, 85, 322, 1
     )
 
     local level_label = make_text_block(
         content, suffix, "LevelLabel", "LEVEL",
         config.label_size, config.muted_text_colour,
-        16, 80, 90, 23
+        16, 96, 90, 23
     )
 
     local level_value = make_text_block(
         content, suffix, "LevelValue", "--",
         config.value_size, config.text_colour,
-        265, 78, 70, 25
+        265, 94, 70, 25
     )
 
     local xp_label = make_text_block(
         content, suffix, "XPLabel", "XP",
         config.label_size, config.muted_text_colour,
-        16, 107, 90, 23
+        16, 123, 90, 23
     )
 
     local xp_value = make_text_block(
         content, suffix, "XPValue", "--",
         config.value_size, config.text_colour,
-        265, 105, 70, 25
+        265, 121, 70, 25
     )
 
     local progress = construct(
@@ -309,19 +319,13 @@ local function build()
     )
 
     if progress ~= nil then
-        add_canvas_child(content, progress, 16, 137, 322, 12)
+        add_canvas_child(content, progress, 16, 153, 322, 12)
         pcall(function() progress:SetPercent(0.0) end)
 
-        -- Keep the filled portion bright, but darken the unfilled track so the
-        -- current XP position is immediately readable.
         pcall(function()
             progress:SetFillColorAndOpacity(config.xp_fill_colour)
         end)
 
-        -- UProgressBar's background is stored in WidgetStyle.BackgroundImage.
-        -- Mutate a local style copy and assign it back; if this reflected
-        -- struct path differs in this UE build, the pcall safely falls back
-        -- to the native default.
         pcall(function()
             local style = progress.WidgetStyle
             style.BackgroundImage.TintColor = {
@@ -332,32 +336,57 @@ local function build()
         end)
     end
 
+    local next_label = make_text_block(
+        content, suffix, "NextLabel", "NEXT",
+        config.next_size, config.muted_text_colour,
+        16, 174, 48, 20
+    )
+
+    local next_value = make_text_block(
+        content, suffix, "NextValue", "Proven I · L5",
+        config.next_size, config.text_colour,
+        69, 174, 265, 20
+    )
+
+    local next_bonus = make_text_block(
+        content, suffix, "NextBonus", "",
+        config.next_size, config.muted_text_colour,
+        69, 194, 265, 19
+    )
+
     local status = make_text_block(
         content, suffix, "Status", "",
         config.label_size, config.muted_text_colour,
-        16, 84, 318, 42
+        16, 94, 318, 70
     )
     set_opacity(status, 0.0)
 
-    if title == nil or weapon == nil or divider == nil
+    if title == nil or weapon == nil or rank == nil or divider == nil
        or level_label == nil or level_value == nil
-       or xp_label == nil or xp_value == nil or status == nil then
+       or xp_label == nil or xp_value == nil
+       or next_label == nil or next_value == nil or next_bonus == nil
+       or status == nil then
         log("build aborted: one or more card widgets failed")
         return false
     end
 
     runtime.root=root; runtime.tree=tree; runtime.canvas=canvas
     runtime.outer=outer_frame; runtime.inner=inner; runtime.content=content
-    runtime.refs.title=title; runtime.refs.weapon=weapon
+    runtime.refs.title=title; runtime.refs.weapon=weapon; runtime.refs.rank=rank
     runtime.refs.level_label=level_label; runtime.refs.level_value=level_value
     runtime.refs.xp_label=xp_label; runtime.refs.xp_value=xp_value
-    runtime.refs.xp_bar=progress; runtime.refs.status=status
+    runtime.refs.xp_bar=progress
+    runtime.refs.next_label=next_label; runtime.refs.next_value=next_value
+    runtime.refs.next_bonus=next_bonus; runtime.refs.status=status
 
     runtime.rendered={
         title=tostring(config.title or ""),
         weapon="No active weapon",
+        rank="UNRANKED",
         level_value="--",
         xp_value="--",
+        next_value="Proven I · L5",
+        next_bonus="",
         status="",
     }
 
@@ -380,11 +409,15 @@ local function set_stat_mode(show_stats)
     local stat_opacity = show_stats and 1.0 or 0.0
     local status_opacity = show_stats and 0.0 or 1.0
 
+    set_opacity(runtime.refs.rank, stat_opacity)
     set_opacity(runtime.refs.level_label, stat_opacity)
     set_opacity(runtime.refs.level_value, stat_opacity)
     set_opacity(runtime.refs.xp_label, stat_opacity)
     set_opacity(runtime.refs.xp_value, stat_opacity)
     set_opacity(runtime.refs.xp_bar, stat_opacity)
+    set_opacity(runtime.refs.next_label, stat_opacity)
+    set_opacity(runtime.refs.next_value, stat_opacity)
+    set_opacity(runtime.refs.next_bonus, stat_opacity)
     set_opacity(runtime.refs.status, status_opacity)
 end
 
@@ -403,6 +436,21 @@ local function render(state)
 
     set_stat_mode(true)
     set_text("status", "")
+
+    local rank = state.rank
+    if rank == nil or tostring(rank) == "" then
+        set_text("rank", "UNRANKED")
+    else
+        set_text("rank", string.upper(tostring(rank)))
+    end
+
+    if state.next_rank ~= nil and state.next_level ~= nil then
+        set_text("next_value", tostring(state.next_rank) .. " · L" .. tostring(math.floor(tonumber(state.next_level) or 0)))
+        set_text("next_bonus", tostring(state.next_bonus or ""))
+    else
+        set_text("next_value", "MAX RANK")
+        set_text("next_bonus", "")
+    end
 
     local level = tonumber(state.level)
     if level == nil then
