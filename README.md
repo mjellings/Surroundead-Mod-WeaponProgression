@@ -6,6 +6,7 @@ Instead of every weapon of the same type being identical, WeaponProgression trac
 
 > **Current status:** Early development / testing  
 > **Current stable baseline:** v0.15.0  
+> **In development:** v0.17.0-dev1 (mastery milestones)  
 > **Game:** SurrounDead  
 > **Framework:** UE4SS
 
@@ -23,6 +24,7 @@ Two weapons of the same type can therefore have completely different:
 - XP
 - Kill counts
 - Stat upgrades
+- Mastery ranks
 
 Switching weapons does not transfer progression between them.
 
@@ -55,6 +57,34 @@ Not every firearm contains every stat. WeaponProgression detects the stats actua
 
 By default, the same stat will not be selected on two consecutive level-ups when another eligible stat is available.
 
+### Mastery Milestones
+
+In addition to the random level-up reward, weapons can unlock fixed mastery milestones at configured levels.
+
+Each milestone grants:
+
+- A named rank (for example Proven I, Trusted II, Elite I)
+- A deterministic bonus to a specific stat
+
+Milestone bonuses are separate from the normal random upgrades. They are reconstructed from the weapon's level, so a weapon that reaches Level 20 always receives every milestone up to that level.
+
+Key behaviour:
+
+- Milestones are fully configurable in `config.ini`
+- Bonuses only apply when the weapon actually has that stat
+- Optional fallbacks are supported (for example RPM milestones can fall back to Damage Falloff on weapons without FirearmRPM)
+- Milestone bonuses and random upgrades share the same cumulative caps
+- Percentage milestone bonuses are applied from the captured original base, not compounded onto already-upgraded values
+
+Default milestones currently run every 5 levels from Level 5 through Level 75, progressing through Proven, Trusted, Veteran, Elite, and Signature ranks.
+
+Current rank and next milestone are shown in:
+
+- The inventory tooltip (Rank / Next)
+- The F8 status card (rank, next rank, and next bonus)
+
+Press **F8** while holding a tracked firearm to open the native status card. It auto-closes after a few seconds and resets that timer if you switch weapons.
+
 ### Rolled Weapon Stats Are Preserved
 
 SurrounDead weapons can have different base/rolled statistics.
@@ -78,6 +108,8 @@ Persisted information includes:
 - Number of upgrades applied to each stat
 - Last upgraded stat
 - Pending rewards
+
+Mastery rank is derived from the weapon's level and the configured milestone table, so it does not need a separate persisted field.
 
 This allows an upgraded physical weapon to retain its progression across full SurrounDead restarts.
 
@@ -112,7 +144,8 @@ ue4ss/
         ├── enabled.txt
         ├── config.ini
         └── Scripts/
-            └── main.lua
+            ├── main.lua
+            └── ui.lua
 ```
 
 WeaponProgression will create its progression database automatically when required.
@@ -123,9 +156,9 @@ WeaponProgression will create its progression database automatically when requir
 
 Progression behaviour can be customised through `config.ini`.
 
-Current configurable values include weapon XP progression and the strength of individual stat upgrades.
+### Stat upgrades
 
-Default upgrade values are currently:
+Default per-level random upgrade values:
 
 | Upgrade | Default |
 | --- | ---: |
@@ -134,6 +167,48 @@ Default upgrade values are currently:
 | Critical Hit Multiplier | +2 |
 | RPM | +2% |
 | Damage Falloff | +2% |
+
+### Caps
+
+`[Caps]` sets the maximum total progression bonus above the captured original base. Caps apply to random level-up rewards and milestone bonuses combined.
+
+Default caps:
+
+| Stat | Default cap |
+| --- | ---: |
+| Damage | +30% |
+| Critical Hit Chance | +15 |
+| Critical Hit Multiplier | +20 |
+| RPM | +25% |
+| Damage Falloff | +25% |
+
+### Mastery milestones
+
+The `[Milestones]` section controls fixed rank rewards.
+
+```ini
+[Milestones]
+Enabled=true
+
+; Format:
+; LevelX=Rank Name|BonusType|Value
+;
+; Optional fallback:
+; LevelX=Rank Name|BonusType|Value|FallbackBonusType
+
+Level5=Proven I|DamagePercent|2
+Level20=Trusted I|RPMPercent|3|FalloffPercent
+```
+
+Supported bonus types:
+
+- `DamagePercent`
+- `CriticalChancePoints`
+- `CriticalMultiplierPoints`
+- `RPMPercent`
+- `FalloffPercent`
+
+Set `Enabled=false` to disable milestones entirely while leaving the rest of progression unchanged.
 
 These values are subject to balancing while the mod remains in development.
 
@@ -186,24 +261,19 @@ Back up your saves when testing development versions.
 
 v0.15.0 is the current known-working release. It builds on the proven v0.13.0 progression core (per-weapon XP, permanent upgrades, persistence, and native level-up notifications), with later additions including live weapon caching (v0.14.0) and native inventory tooltip display of weapon level, XP, and kills.
 
-Testing has demonstrated:
-
-- Independent physical weapon identification
-- Multiple weapons progressing simultaneously
-- Independent XP and kill tracking
-- Variable firearm stat sets
-- Permanent stat upgrades
-- Preservation of original rolled statistics
-- Deterministic stat reconstruction
-- Progression persistence across full game restarts
-- Live stat mutation
-- Post-mutation verification
-- Native SurrounDead level-up notifications
-- Weapon switching without progression crossing between weapons
-- Live weapon slot caching with safe fallback
-- Native tooltip rows for weapon level, XP, and kills
-
 v0.15.0 is being retained as the known-working baseline while further development continues.
+
+### v0.17.0-dev1 — In Development
+
+Current development work adds configurable mastery milestones on top of the v0.15.x / v0.16.x progression and status UI core.
+
+New in this line of work:
+
+- Configurable mastery ranks and fixed milestone bonuses
+- Deterministic milestone reconstruction from weapon level
+- Shared cumulative caps across random upgrades and milestones
+- Tooltip Rank / Next rows
+- F8 status card showing current rank, next milestone, and next bonus
 
 ---
 
@@ -214,10 +284,9 @@ Areas currently being investigated include:
 - Runtime performance improvements and safer weapon caching
 - Melee weapon support
 - Additional weapon/stat types
-- Improved progression/status UI
+- Milestone balancing and additional bonus types
 - More notification configuration
 - Database migrations and backups
-- Additional configuration options
 - Broader weapon compatibility testing
 - Reduced development/debug logging
 
@@ -240,18 +309,20 @@ XP awarded
    ↓
 Weapon levels up
    ↓
-Eligible stat selected
+Eligible random stat selected
+   ↓
+If level matches a milestone → fixed rank bonus applied
    ↓
 Reward persisted
    ↓
-Live weapon stat updated
+Live weapon stats reconciled
    ↓
 Updated value verified
    ↓
 Native level-up notification displayed
 ```
 
-On later game sessions, persisted upgrade counts are used together with the weapon's original base statistics to reconstruct the correct upgraded values.
+On later game sessions, persisted upgrade counts and the weapon's level are used together with the original base statistics to reconstruct both random upgrades and milestone bonuses.
 
 The mod deliberately avoids blindly modifying whatever weapon happens to be equipped or relying only on a weapon's type/name.
 
