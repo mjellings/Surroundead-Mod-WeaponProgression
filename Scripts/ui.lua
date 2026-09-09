@@ -1,6 +1,6 @@
 -- ============================================================================
 -- WeaponProgression UI module
--- v0.17.0-dev1 mastery milestone status-card layout
+-- v0.17.0-dev2 effective-stat mastery status-card layout
 -- Presentation only: no gameplay hooks, GUID logic, DB access or XP formulas.
 -- ============================================================================
 
@@ -9,7 +9,7 @@ local PREFIX = "[WeaponProgression.UI] "
 
 local config = {
     title = "WEAPON PROGRESSION",
-    x = 92.0, y = 250.0, width = 356.0, height = 228.0, z_order = 200,
+    x = 92.0, y = 250.0, width = 356.0, height = 362.0, z_order = 200,
 
     outer_colour      = { R=0.18, G=0.18, B=0.18, A=0.95 },
     background_colour = { R=0.035, G=0.035, B=0.035, A=0.94 },
@@ -35,6 +35,7 @@ local runtime = {
         xp_label=nil, xp_value=nil,
         xp_bar=nil,
         next_label=nil, next_value=nil, next_bonus=nil,
+        stats_header=nil, stat_rows={},
         status=nil,
     },
     provider=nil, state=nil, rendered={}, serial=0,
@@ -142,6 +143,15 @@ local function set_text(key, value)
         return true
     end
     return false
+end
+
+local function set_textblock(block, value)
+    local b = unwrap(block)
+    if b == nil or not is_valid(b) then return false end
+    local text = make_text(value)
+    if text == nil then return false end
+    local ok = pcall(function() b:SetText(text) end)
+    return ok
 end
 
 local function set_opacity(widget, value)
@@ -321,49 +331,71 @@ local function build()
     if progress ~= nil then
         add_canvas_child(content, progress, 16, 153, 322, 12)
         pcall(function() progress:SetPercent(0.0) end)
-
-        pcall(function()
-            progress:SetFillColorAndOpacity(config.xp_fill_colour)
-        end)
-
+        pcall(function() progress:SetFillColorAndOpacity(config.xp_fill_colour) end)
         pcall(function()
             local style = progress.WidgetStyle
-            style.BackgroundImage.TintColor = {
-                SpecifiedColor = config.xp_track_colour,
-                ColorUseRule = 0,
-            }
+            style.BackgroundImage.TintColor = { SpecifiedColor = config.xp_track_colour, ColorUseRule = 0 }
             progress.WidgetStyle = style
         end)
     end
 
+    local stats_header = make_text_block(
+        content, suffix, "StatsHeader", "WEAPON STATS",
+        config.next_size, config.muted_text_colour,
+        16, 176, 150, 19
+    )
+
+    local stat_specs = {
+        { key="damage",     label="Damage" },
+        { key="critmult",   label="Crit Mult" },
+        { key="critchance", label="Crit Chance" },
+        { key="rpm",        label="RPM" },
+        { key="falloff",    label="Falloff" },
+    }
+    local stat_rows = {}
+    for i, spec in ipairs(stat_specs) do
+        local y = 197 + ((i - 1) * 22)
+        local label = make_text_block(content, suffix, "StatLabel" .. tostring(i), spec.label,
+            config.next_size, config.muted_text_colour, 16, y, 88, 20)
+        local value = make_text_block(content, suffix, "StatValue" .. tostring(i), "--",
+            config.next_size, config.text_colour, 106, y, 224, 20)
+        stat_rows[spec.key] = { label=label, value=value }
+    end
+
+    local lower_divider = make_border(
+        content, suffix, "LowerDivider", config.divider_colour,
+        16, 310, 322, 1
+    )
+
     local next_label = make_text_block(
         content, suffix, "NextLabel", "NEXT",
         config.next_size, config.muted_text_colour,
-        16, 174, 48, 20
+        16, 320, 48, 20
     )
 
     local next_value = make_text_block(
         content, suffix, "NextValue", "Proven I · L5",
         config.next_size, config.text_colour,
-        69, 174, 265, 20
+        69, 320, 265, 20
     )
 
     local next_bonus = make_text_block(
         content, suffix, "NextBonus", "",
         config.next_size, config.muted_text_colour,
-        69, 194, 265, 19
+        69, 339, 265, 19
     )
 
     local status = make_text_block(
         content, suffix, "Status", "",
         config.label_size, config.muted_text_colour,
-        16, 94, 318, 70
+        16, 94, 318, 120
     )
     set_opacity(status, 0.0)
 
     if title == nil or weapon == nil or rank == nil or divider == nil
        or level_label == nil or level_value == nil
        or xp_label == nil or xp_value == nil
+       or stats_header == nil or lower_divider == nil
        or next_label == nil or next_value == nil or next_bonus == nil
        or status == nil then
         log("build aborted: one or more card widgets failed")
@@ -376,6 +408,7 @@ local function build()
     runtime.refs.level_label=level_label; runtime.refs.level_value=level_value
     runtime.refs.xp_label=xp_label; runtime.refs.xp_value=xp_value
     runtime.refs.xp_bar=progress
+    runtime.refs.stats_header=stats_header; runtime.refs.stat_rows=stat_rows
     runtime.refs.next_label=next_label; runtime.refs.next_value=next_value
     runtime.refs.next_bonus=next_bonus; runtime.refs.status=status
 
@@ -415,6 +448,11 @@ local function set_stat_mode(show_stats)
     set_opacity(runtime.refs.xp_label, stat_opacity)
     set_opacity(runtime.refs.xp_value, stat_opacity)
     set_opacity(runtime.refs.xp_bar, stat_opacity)
+    set_opacity(runtime.refs.stats_header, stat_opacity)
+    for _, row in pairs(runtime.refs.stat_rows or {}) do
+        set_opacity(row.label, stat_opacity)
+        set_opacity(row.value, stat_opacity)
+    end
     set_opacity(runtime.refs.next_label, stat_opacity)
     set_opacity(runtime.refs.next_value, stat_opacity)
     set_opacity(runtime.refs.next_bonus, stat_opacity)
@@ -467,6 +505,25 @@ local function render(state)
         xp = math.max(0, math.min(100, xp))
         set_text("xp_value", tostring(math.floor(xp + 0.5)) .. "%")
         set_progress(xp)
+    end
+
+    local statByKey = {}
+    for _, stat in ipairs(state.stats or {}) do
+        if stat.key ~= nil then statByKey[tostring(stat.key)] = stat end
+    end
+    for key, row in pairs(runtime.refs.stat_rows or {}) do
+        local stat = statByKey[key]
+        if stat ~= nil and stat.base ~= nil and stat.current ~= nil then
+            local text = tostring(stat.base) .. "  →  " .. tostring(stat.current)
+            if stat.bonus ~= nil and tostring(stat.bonus) ~= "" then
+                text = text .. "   (" .. tostring(stat.bonus) .. ")"
+            end
+            set_textblock(row.value, text)
+            set_opacity(row.label, 1.0); set_opacity(row.value, 1.0)
+        else
+            set_textblock(row.value, "--")
+            set_opacity(row.label, 0.35); set_opacity(row.value, 0.35)
+        end
     end
 
     return true

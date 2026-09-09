@@ -1,4 +1,4 @@
--- WeaponProgression v0.17.0-dev1 - Configurable mastery milestones
+-- WeaponProgression v0.17.0-dev3 - Effective-stat UI switch refresh fix
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Development build based on the proven v0.15.1 progression + utility core.
@@ -59,11 +59,11 @@
 --   v0.16.0-dev1 - Reusable ui.lua panel integrated; F8 shows live held-weapon Level / XP using active slot -> physical UID mapping.
 --   v0.16.0-dev2 - Stabilise active UI UID during combat callbacks; auto-close panel after 3s and reset timer on weapon switch.
 --   v0.16.0-dev3 - Compact native-style status card with aligned stats, divider and native UMG XP progress bar.
---   v0.17.0-dev1 - Configurable mastery milestones/ranks, deterministic milestone bonuses, cumulative caps, tooltip + F8 rank/next-rank UI.
+--   v0.17.0-dev2 - Effective-stat UI/ranks, deterministic milestone bonuses, cumulative caps, tooltip + F8 rank/next-rank UI.
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.17.0-dev1"
+local VERSION = "0.17.0-dev3"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -244,6 +244,7 @@ local save_db = nil
 local reconcile_weapon_stats = nil
 local process_pending_rewards = nil
 local stat_target = nil
+local progression_bonus_label = nil
 local cachedJigComponent = nil
 
 local QUIET_LOG_PREFIXES = {
@@ -1577,6 +1578,25 @@ local function ui_progression_state()
 
     local currentRank, nextRank = get_rank_info(level)
 
+    local uiStats = {}
+    r.bases = r.bases or {}
+    r.upgrades = r.upgrades or {}
+    for _, def in ipairs(STAT_DEFS) do
+        local base = tonumber(r.bases[def.key])
+        if base ~= nil then
+            local count = math.floor(tonumber(r.upgrades[def.key]) or 0)
+            local target = stat_target(def, base, count, r)
+            if target ~= nil then
+                uiStats[#uiStats + 1] = {
+                    key = def.key,
+                    base = math.floor(base + 0.5),
+                    current = math.floor(target + 0.5),
+                    bonus = progression_bonus_label(def, base, target),
+                }
+            end
+        end
+    end
+
     return {
         weapon = tostring(r.weapon or uiActive.weapon or "Unknown"),
         level = level,
@@ -1585,6 +1605,7 @@ local function ui_progression_state()
         next_rank = nextRank and tostring(nextRank.rank) or nil,
         next_level = nextRank and tonumber(nextRank.level) or nil,
         next_bonus = nextRank and milestone_bonus_description(nextRank, r) or nil,
+        stats = uiStats,
     }
 end
 
@@ -1776,7 +1797,7 @@ if UI ~= nil then
             x = 92,
             y = 250,
             width = 356,
-            height = 228,
+            height = 362,
             z_order = 200,
         })
 
@@ -2416,10 +2437,31 @@ local function display_number(v)
     return string.format("%.1f", rounded):gsub("0+$", ""):gsub("%.$", "")
 end
 
+local function display_integer(v)
+    local n = tonumber(v)
+    if n == nil then return nil end
+    return tostring(math.floor(n + (n >= 0 and 0.5 or -0.5)))
+end
+
 local function bonus_text(v)
     local n = tonumber(v) or 0
     if math.abs(n) < 0.000001 then return nil end
-    return display_number(n)
+    return display_integer(n)
+end
+
+progression_bonus_label = function(def, base, target)
+    base = tonumber(base)
+    target = tonumber(target)
+    if def == nil or base == nil or target == nil then return nil end
+    if def.mode == "percent" then
+        if math.abs(base) < 0.000001 then return nil end
+        local pct = ((target / base) - 1.0) * 100.0
+        if math.abs(pct) < 0.000001 then return nil end
+        return (pct >= 0 and "+" or "") .. display_integer(pct) .. "%"
+    end
+    local points = target - base
+    if math.abs(points) < 0.000001 then return nil end
+    return (points >= 0 and "+" or "") .. display_integer(points)
 end
 
 local tooltipTextLibrary = nil
@@ -2662,9 +2704,16 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
                     target ~= nil and string.format("%.3f", target) or "<nil>",
                     bonus, count
                 ))
-                if target ~= nil and math.abs(bonus) >= 0.000001 then
-                    parts[#parts + 1] = string.format("%s %+0.3f", def.tag, bonus)
-                    tooltipBonusContext.by_tag[def.tag] = bonus
+                if target ~= nil then
+                    local bonusLabel = progression_bonus_label(def, base, target)
+                    if bonusLabel ~= nil then
+                        parts[#parts + 1] = string.format("%s %s", def.tag, bonusLabel)
+                    end
+                    tooltipBonusContext.by_tag[def.tag] = {
+                        base = base,
+                        target = target,
+                        bonus_label = bonusLabel,
+                    }
                 end
             end
         end
@@ -2755,7 +2804,7 @@ local function on_stat_w_construct(Context, ...)
             " | label=" .. tostring(label))
         return
     end
-    local bonus = ctx.by_tag[tagName]
+    local statInfo = ctx.by_tag[tagName]
 
     local valueBlock = nil
     pcall(function() valueBlock = unwrap(w["TextBlock"]) end)
@@ -2775,10 +2824,14 @@ local function on_stat_w_construct(Context, ...)
 
     local unit = field_text(w, "ExtraText") or field_text(w, "ExtraTxt") or ""
     if unit == "None" then unit = "" end
-    local rendered = display_number(currentNumber) .. unit_suffix(unit)
-    local suffix = bonus_text(bonus)
+    -- Vanilla builds this row from its own value. For progressed weapons show
+    -- WeaponProgression's deterministic effective target instead, rounded to
+    -- whole numbers so the player sees the stat the weapon actually has.
+    local effective = (type(statInfo) == "table" and tonumber(statInfo.target)) or currentNumber
+    local rendered = display_integer(effective) .. unit_suffix(unit)
+    local suffix = type(statInfo) == "table" and statInfo.bonus_label or nil
     if suffix ~= nil then
-        rendered = rendered .. " (+" .. suffix .. ")"
+        rendered = rendered .. " (" .. suffix .. ")"
     end
 
     local okSet, setErr = set_textblock_text(valueBlock, rendered)
@@ -2900,7 +2953,7 @@ log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; v0.15.
 log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native SurrounDead notification UI. STAT VERIFY DEBOUNCE active.")
 log("data.db v2 is authoritative for base stats + earned upgrades; previous snapshot retained as data.db.bak.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
-log("NATIVE TOOLTIP ACTIVE | one-decimal stat formatting, inline units/bonuses, and Level / XP% / Kills rows enabled.")
+log("NATIVE TOOLTIP ACTIVE | rounded effective stats, inline progression bonuses, and Level / XP% / Kills / mastery rows enabled.")
 log("REUSABLE NATIVE UI ACTIVE | mastery rank + next milestone | XP bar | 3s auto-close reset by weapon switch.")
 log("MASTERY MILESTONES ACTIVE | config.ini-driven fixed bonuses + cumulative caps | deterministic reconstruction from weapon level.")
 log("----------------------------------------------------------------")
