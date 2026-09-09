@@ -1,4 +1,4 @@
--- WeaponProgression v0.17.0-dev3 - Effective-stat UI switch refresh fix
+-- WeaponProgression v0.18.1 - Compatibility guard
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Development build based on the proven v0.15.1 progression + utility core.
@@ -63,7 +63,7 @@
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.17.0-dev3"
+local VERSION = "0.18.1"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -282,6 +282,48 @@ local function log(msg)
     end
     print(PREFIX .. text .. "\n")
 end
+
+-- ============================================================================
+-- Compatibility / fragile native-tooltip guard
+-- ============================================================================
+
+local Compatibility = nil
+
+local function load_compatibility_module()
+    local errors = {}
+
+    if MOD_DIR ~= nil then
+        local compatPath = MOD_DIR .. "/Scripts/compatibility.lua"
+        local okLoad, chunkOrErr = pcall(loadfile, compatPath)
+        if okLoad and type(chunkOrErr) == "function" then
+            local okRun, moduleOrErr = pcall(chunkOrErr)
+            if okRun and type(moduleOrErr) == "table" then
+                Compatibility = moduleOrErr
+                Compatibility.Configure({ log = log })
+                log("COMPAT MODULE | loaded " .. compatPath)
+                return true
+            end
+            errors[#errors + 1] = "loadfile run: " .. tostring(moduleOrErr)
+        else
+            errors[#errors + 1] = "loadfile: " .. tostring(chunkOrErr)
+        end
+    end
+
+    local okRequire, moduleOrErr = pcall(require, "compatibility")
+    if okRequire and type(moduleOrErr) == "table" then
+        Compatibility = moduleOrErr
+        Compatibility.Configure({ log = log })
+        log('COMPAT MODULE | loaded via require("compatibility")')
+        return true
+    end
+
+    errors[#errors + 1] = "require: " .. tostring(moduleOrErr)
+    log("COMPAT MODULE UNAVAILABLE | tooltip hooks will use legacy registration | " ..
+        table.concat(errors, " | "))
+    return false
+end
+
+load_compatibility_module()
 
 -- ============================================================================
 -- Reusable native UI module
@@ -2918,13 +2960,35 @@ local function try_register_hooks()
     retryRound = retryRound + 1
     find_guid_library()
 
+    if Compatibility ~= nil and retryRound == 1 then
+        Compatibility.LogEnvironment()
+    end
+
     for _, h in ipairs(hooks) do
-        register_one(h[1], h[2], h[3])
+        local key = h[1]
+
+        if not registered[key] then
+            local allowed = true
+            local reason = nil
+
+            if Compatibility ~= nil then
+                allowed, reason = Compatibility.CheckHook(key)
+            end
+
+            if allowed then
+                register_one(key, h[2], h[3])
+            elseif retryRound == 1 or retryRound % 5 == 0 then
+                log("COMPAT WAIT | " .. tostring(key) ..
+                    " | hook not attempted; expected capability not available yet | missing=" ..
+                    tostring(reason))
+            end
+        end
     end
 
     local n = registered_count()
 
     if n == #hooks then
+        if Compatibility ~= nil then Compatibility.Summarize() end
         log("All " .. tostring(#hooks) .. " hooks active.")
         log("Ready: configurable progression is active.")
         log("Persistent progression armed: first resolved use captures base stats; each level-up awards and stores one stat upgrade.")
@@ -2942,8 +3006,39 @@ local function try_register_hooks()
 
     if retryRound < MAX_RETRY_ROUNDS then
         ExecuteWithDelay(RETRY_DELAY_MS, try_register_hooks)
+        return
+    end
+
+    -- Do not let missing/changed tooltip Blueprints make the whole mod look
+    -- dead. At the end of the normal Blueprint retry window, intentionally
+    -- disable only unresolved compatibility-gated tooltip hooks.
+    local skippedTooltip = 0
+    if Compatibility ~= nil then
+        for _, h in ipairs(hooks) do
+            local key = h[1]
+            if not registered[key] and Compatibility.IsTooltipHook(key) then
+                local allowed, reason = Compatibility.CheckHook(key)
+                if not allowed then
+                    registered[key] = "compat_skipped"
+                    skippedTooltip = skippedTooltip + 1
+                    log("COMPAT DISABLE | " .. tostring(key) ..
+                        " | hook was never attempted because expected capability is missing/changed | " ..
+                        tostring(reason))
+                end
+            end
+        end
+    end
+
+    n = registered_count()
+
+    if n == #hooks then
+        if Compatibility ~= nil then Compatibility.Summarize() end
+        log("All " .. tostring(#hooks) .. " hooks resolved; " ..
+            tostring(skippedTooltip) .. " tooltip hook(s) disabled by compatibility guard.")
+        log("Ready: core configurable progression is active.")
+        log("Persistent progression armed: first resolved use captures base stats; each level-up awards and stores one stat upgrade.")
     else
-        log("ERROR: stopped hook retries before all hooks became available.")
+        log("ERROR: stopped hook retries before all required core hooks became available.")
     end
 end
 
@@ -2953,7 +3048,8 @@ log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; v0.15.
 log("NATIVE LEVEL-UP TOASTS ACTIVE | KismetTextLibrary FText conversion + native SurrounDead notification UI. STAT VERIFY DEBOUNCE active.")
 log("data.db v2 is authoritative for base stats + earned upgrades; previous snapshot retained as data.db.bak.")
 log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pickup NOT required.\n[WeaponProgression] MUTATION ROUTE | GetEquipmentUID identifies weapon; live JSI_Slot_C.ItemUniqueID wrapper performs stat writes.")
-log("NATIVE TOOLTIP ACTIVE | rounded effective stats, inline progression bonuses, and Level / XP% / Kills / mastery rows enabled.")
+log("NATIVE TOOLTIP REQUESTED | rounded effective stats, inline progression bonuses, and Level / XP% / Kills / mastery rows.")
+log("COMPATIBILITY GUARD ACTIVE | tooltip hooks are attempted only after their expected Blueprint classes/UFunctions are present; game version is logged diagnostically.")
 log("REUSABLE NATIVE UI ACTIVE | mastery rank + next milestone | XP bar | 3s auto-close reset by weapon switch.")
 log("MASTERY MILESTONES ACTIVE | config.ini-driven fixed bonuses + cumulative caps | deterministic reconstruction from weapon level.")
 log("----------------------------------------------------------------")
