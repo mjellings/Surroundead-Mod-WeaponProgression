@@ -4,9 +4,9 @@ A UE4SS Lua mod for **SurrounDead** that gives individual weapons their own pers
 
 Instead of every weapon of the same type being identical, WeaponProgression tracks each physical weapon separately. Use a weapon in combat, earn XP with it, level it up, and receive permanent stat improvements that stay associated with that specific weapon.
 
-> **Current status:** Early development / testing  
-> **Current stable baseline:** v0.15.0  
-> **In development:** v0.17.0-dev1 (mastery milestones)  
+> **Current status:** Active development / testing  
+> **Current stable release:** v0.18.3  
+> **In development:** v0.18.4-dev7 (integrated Dave gunsmith / spawn research)  
 > **Game:** SurrounDead  
 > **Framework:** UE4SS
 
@@ -78,12 +78,31 @@ Key behaviour:
 
 Default milestones currently run every 5 levels from Level 5 through Level 75, progressing through Proven, Trusted, Veteran, Elite, and Signature ranks.
 
-Current rank and next milestone are shown in:
+Current rank and next-milestone information is shown on the **F8 status card**.
 
-- The inventory tooltip (Rank / Next)
-- The F8 status card (rank, next rank, and next bonus)
+The normal inventory tooltip still shows the effective progression bonus beside supported weapon stats. Extra custom Level / XP / Kills / Rank tooltip rows are disabled by default for compatibility because some UE4SS builds were observed to native-crash while additional tooltip widgets were being injected.
 
 Press **F8** while holding a tracked firearm to open the native status card. It auto-closes after a few seconds and resets that timer if you switch weapons.
+
+### Dave's Gunsmith (Development)
+
+The current development branch includes an integrated gunsmith NPC named **Dave**.
+
+Dave is spawned from SurrounDead's native QuestGiver actor and uses the game's normal interaction prompt. The gunsmith feature is now part of WeaponProgression itself rather than a separate research mod.
+
+Current development behaviour:
+
+- Native `[F] Dave` interaction
+- Custom gunsmith UI
+- Reads the currently held physical weapon directly from WeaponProgression's in-memory state
+- Level 5+ requirement for reroll eligibility
+- Free reroll testing while the feature is being developed
+- Rerolls redistribute the weapon's ordinary random progression upgrades
+- Level, XP, kills, weapon identity and mastery progression are preserved
+- The UI closes when the player moves away from Dave
+- Spawn-location research currently uses named development points in `Scripts/dave_locations.lua`
+
+The temporary standalone `NPCRerollResearch` mod is no longer required when testing the integrated development build.
 
 ### Rolled Weapon Stats Are Preserved
 
@@ -145,7 +164,11 @@ ue4ss/
         ├── config.ini
         └── Scripts/
             ├── main.lua
-            └── ui.lua
+            ├── ui.lua
+            ├── compatibility.lua
+            ├── gunsmith.lua
+            ├── gunsmith_ui.lua
+            └── dave_locations.lua   # development branch only
 ```
 
 WeaponProgression will create its progression database automatically when required.
@@ -212,6 +235,20 @@ Set `Enabled=false` to disable milestones entirely while leaving the rest of pro
 
 These values are subject to balancing while the mod remains in development.
 
+### Tooltip compatibility
+
+The `[Utility]` section contains:
+
+```ini
+[Utility]
+VerboseLogging=false
+ShowProgressionTooltipRows=false
+```
+
+`ShowProgressionTooltipRows=false` is the recommended/default setting. Progression bonuses still appear beside supported weapon stats in the normal tooltip, while full Level / XP / Kills / Rank information remains available through F8.
+
+The optional extra progression rows are currently considered experimental because native access-violation crashes were reproduced on some UE4SS builds while those additional tooltip widgets were being injected.
+
 ---
 
 ## Important: `data.db`
@@ -248,6 +285,8 @@ Known limitations currently include:
 - Progression currently focuses on firearms.
 - Some runtime weapon discovery operations still need performance optimisation.
 - Compatibility across all SurrounDead weapons has not yet been exhaustively tested.
+- Extra custom progression rows in the inventory tooltip are disabled by default for compatibility.
+- Dave's gunsmith is still in development; spawn locations and reroll cost/balancing are not final.
 - The persistence format may change during development.
 - Multiplayer behaviour has not yet been considered stable or supported.
 
@@ -257,23 +296,29 @@ Back up your saves when testing development versions.
 
 ## Development Status
 
-### v0.15.0 — Current Stable Baseline
+### v0.18.3 — Current Stable Release
 
-v0.15.0 is the current known-working release. It builds on the proven v0.13.0 progression core (per-weapon XP, permanent upgrades, persistence, and native level-up notifications), with later additions including live weapon caching (v0.14.0) and native inventory tooltip display of weapon level, XP, and kills.
+v0.18.3 is the current public compatibility release.
 
-v0.15.0 is being retained as the known-working baseline while further development continues.
+It retains the progression, persistence, mastery and F8 status-card systems while hardening the inventory tooltip path for a wider range of UE4SS builds. The normal tooltip still displays progression bonuses beside supported weapon stats, but the additional custom Level / XP / Kills / Rank rows are disabled by default.
 
-### v0.17.0-dev1 — In Development
+### v0.18.4-dev7 — In Development
 
-Current development work adds configurable mastery milestones on top of the v0.15.x / v0.16.x progression and status UI core.
+Current development work integrates **Dave**, a native-interaction gunsmith NPC, directly into WeaponProgression.
 
-New in this line of work:
+The previous research implementation communicated with WeaponProgression through temporary files. The integrated version now reads held-weapon state and performs rerolls directly in memory.
 
-- Configurable mastery ranks and fixed milestone bonuses
-- Deterministic milestone reconstruction from weapon level
-- Shared cumulative caps across random upgrades and milestones
-- Tooltip Rank / Next rows
-- F8 status card showing current rank, next milestone, and next bonus
+Current development work also includes:
+
+- Native `[F] Dave` prompt
+- Custom gunsmith UI
+- Level 5+ reroll eligibility
+- Direct in-memory rerolls
+- Named development spawn locations
+- QuestGiver ground-offset research
+- F5 / F6 / F7 spawn-development controls
+
+The eventual v0.19 release is expected to use a verified baked list of possible Dave locations and randomise his spawn rather than expose the development location list directly.
 
 ---
 
@@ -281,6 +326,10 @@ New in this line of work:
 
 Areas currently being investigated include:
 
+- Finalise and verify multiple Dave spawn locations
+- Randomise Dave's spawn from a baked production location list
+- Add a proper reroll cost/balancing model
+- Continue gunsmith UI polish and NPC behaviour research
 - Runtime performance improvements and safer weapon caching
 - Melee weapon support
 - Additional weapon/stat types

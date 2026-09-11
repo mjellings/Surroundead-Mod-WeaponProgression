@@ -4,6 +4,52 @@ This file records the significant development milestones for WeaponProgression.
 
 The project is still in pre-release development, so older entries include research builds that established behaviour later retained by the current mod.
 
+## v0.18.x
+
+### v0.18.4-dev7
+
+- Integrated the experimental Dave gunsmith NPC directly into WeaponProgression.
+- Removed the temporary file-based bridge between NPCRerollResearch and WeaponProgression; gunsmith state and rerolls now use direct in-memory callbacks.
+- Added a native `[F] Dave` interaction prompt by updating the QuestGiver `Name` / interaction fields on the spawned NPC.
+- Added the dedicated `gunsmith.lua` and `gunsmith_ui.lua` modules.
+- Added free reroll testing for Level 5+ tracked firearms while preserving weapon level, XP, kills, identity and mastery.
+- Added automatic UI close when the player walks away from Dave.
+- Added development controls:
+  - `F5` lowers the current test spawn by 10 Unreal units and respawns Dave.
+  - `F6` destroys and respawns Dave.
+  - `F7` removes Dave.
+- Added `dave_locations.lua` for named development spawn points and a shared `ZOffset`.
+- Confirmed a QuestGiver actor-origin offset of approximately `-80` Unreal units for ground placement.
+- Added the initial Safe Zone and Fishing Lodge development locations.
+- The standalone `NPCRerollResearch` mod is no longer required for integrated testing.
+
+### v0.18.3
+
+- Added a tooltip compatibility release based on multi-user crash investigation.
+- Stopped reading/converting live tooltip `FText` values where WeaponProgression already had authoritative numeric/stat data.
+- Stopped inspecting unrelated item stat widgets unless a tracked firearm tooltip context is active.
+- Kept progression bonus values visible directly in the normal weapon stat rows.
+- Disabled the custom Level / XP / Kills / Rank tooltip rows by default after they were linked to native access-violation crashes on some UE4SS builds.
+- Added `ShowProgressionTooltipRows=false` under `[Utility]`.
+- Full progression information remains available through the F8 status card.
+- Existing `data.db` progression files remain compatible.
+
+### v0.18.2-dev1 / dev2 / dev3
+
+- Investigated native crashes triggered while hovering items with additional tooltip rows.
+- Identified that the original generic `BP_StatW_C:Construct` hook touched bags, food, healing items and other non-weapon stat widgets before confirming a firearm tooltip context.
+- Added an early tooltip-context guard, resolving crashes for non-weapon items in affected installations.
+- Removed live `FText` reads from the tracked-firearm stat formatting path.
+- Added detailed diagnostic breadcrumbs around weapon tooltip resolution, stat-row writes and custom progression-row injection.
+- Isolated the remaining native crash boundary to the custom progression-row injection path.
+- Disabled that path by default, retaining F8 as the safe detailed progression view.
+
+### v0.18.1
+
+- Added compatibility/retry handling for Blueprint tooltip hook registration.
+- Improved startup behaviour on systems where tooltip Blueprint classes were not immediately available.
+
+
 ## v0.17.0-dev1
 
 - Added configurable mastery milestones and named ranks.

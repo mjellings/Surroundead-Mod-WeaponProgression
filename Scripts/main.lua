@@ -1,4 +1,4 @@
--- WeaponProgression v0.18.1 - Compatibility guard
+-- WeaponProgression v0.18.2-dev1 - Tooltip stat-row safety diagnostic
 -- SurrounDead 0.8 / UE 5.6 / UE4SS
 --
 -- Development build based on the proven v0.15.1 progression + utility core.
@@ -23,6 +23,7 @@
 --   DamageFallOff             +2% multiplicative from captured base
 --
 -- Version history:
+--   v0.18.2-dev1 - Diagnostic safety guard: ignore BP_StatW rows unless a tracked firearm tooltip context is active; remove generic FText field-dump probe.
 --   v0.9.5 - Data collection successful. Tester less successful.
 --   v0.9.8 - Integration successful. Timing less successful.
 --   v0.9.8a - Delayed registration + immediate DB creation.
@@ -63,7 +64,7 @@
 --   v0.14.0-dev2 - Invalidate cache on inventory re-add and prefer the newest matching JSI slot after lifecycle changes.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.18.2-dev-api4"
+local VERSION = "0.18.4-dev7"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -150,6 +151,7 @@ local DEFAULT_CONFIG = {
     FalloffPercent = 2.0,
     PreventConsecutiveSameStat = true,
     VerboseLogging = false,
+    ShowProgressionTooltipRows = false,
 
     MilestonesEnabled = true,
     CapDamagePercent = 30.0,
@@ -185,6 +187,7 @@ local Config = {
     FalloffPercent = DEFAULT_CONFIG.FalloffPercent,
     PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat,
     VerboseLogging = DEFAULT_CONFIG.VerboseLogging,
+    ShowProgressionTooltipRows = DEFAULT_CONFIG.ShowProgressionTooltipRows,
 
     MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled,
     CapDamagePercent = DEFAULT_CONFIG.CapDamagePercent,
@@ -980,6 +983,7 @@ local function reset_config()
     Config.FalloffPercent = DEFAULT_CONFIG.FalloffPercent
     Config.PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat
     Config.VerboseLogging = DEFAULT_CONFIG.VerboseLogging
+    Config.ShowProgressionTooltipRows = DEFAULT_CONFIG.ShowProgressionTooltipRows
 
     Config.MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled
     Config.CapDamagePercent = DEFAULT_CONFIG.CapDamagePercent
@@ -1202,12 +1206,16 @@ local function load_config()
                     elseif section == "StatUpgrades" then
                         set_stat_upgrade_value(key, value)
 
-                    elseif section == "Utility" and key == "VerboseLogging" then
+                    elseif section == "Utility" and
+                           (key == "VerboseLogging" or key == "ShowProgressionTooltipRows") then
                         local b = parse_bool(value)
                         if b == nil then
-                            log("CONFIG WARNING | ignored invalid boolean VerboseLogging=" .. tostring(value))
-                        else
+                            log("CONFIG WARNING | ignored invalid boolean " ..
+                                tostring(key) .. "=" .. tostring(value))
+                        elseif key == "VerboseLogging" then
                             Config.VerboseLogging = b
+                        else
+                            Config.ShowProgressionTooltipRows = b
                         end
 
                     elseif section == "Caps" then
@@ -1255,7 +1263,8 @@ local function load_config()
         Config.DamagePercent, Config.CriticalChancePoints, Config.CriticalMultiplierPoints,
         Config.RPMPercent, Config.FalloffPercent, tostring(Config.PreventConsecutiveSameStat)
     ))
-    log("UTILITY CONFIG | verbose_logging=" .. tostring(Config.VerboseLogging))
+    log("UTILITY CONFIG | verbose_logging=" .. tostring(Config.VerboseLogging) ..
+    " | progression_tooltip_rows=" .. tostring(Config.ShowProgressionTooltipRows))
     log(string.format(
         "CAPS | damage=+%.3f%% | crit_chance=+%.3f | crit_mult=+%.3f | rpm=+%.3f%% | falloff=+%.3f%%",
         Config.CapDamagePercent, Config.CapCriticalChancePoints,
@@ -1395,6 +1404,8 @@ end
 --
 -- A one-time top-level JSI slot scan on first F8 open handles the case where
 -- those Blueprint callbacks have not fired since this Lua mod loaded.
+
+local ui_scan_startup_candidates = nil
 
 local uiActive = {
     weapon = nil,
@@ -1561,9 +1572,6 @@ local function ui_state_signature()
     }, "|")
 end
 
-local write_active_weapon_api = nil
-local ui_bootstrap_active_uid = nil
-
 local function ui_log_state(reason)
     local sig = ui_state_signature()
     if sig == uiLastStateSignature then return end
@@ -1574,16 +1582,6 @@ local function ui_log_state(reason)
         " | container=" .. tostring(uiActive.container) ..
         " | uid=" .. tostring(uiActive.uid) ..
         " | firearm=" .. tostring(uiActive.firearm))
-
-    if uiActive.weapon ~= nil and uiActive.slot_tag ~= nil and
-       uiActive.uid == nil and ui_bootstrap_active_uid ~= nil
-    then
-        ui_bootstrap_active_uid("ui_state:" .. tostring(reason))
-    end
-
-    if write_active_weapon_api ~= nil then
-        write_active_weapon_api("ui_state:" .. tostring(reason))
-    end
 end
 
 local function ui_refresh_if_open()
@@ -1666,123 +1664,232 @@ end
 
 
 -- ============================================================================
--- Read-only cross-mod active weapon API snapshot
+-- Integrated Gunsmith API
 -- ============================================================================
--- UE4SS mods may run in separate Lua states, so this tiny file is the stable
--- cross-mod contract. WeaponProgression remains authoritative: consumers only
--- read the snapshot and never parse/write data.db.
---
--- Format: key<TAB>value, one field per line. Replaced atomically via .tmp.
-local ACTIVE_API_PATH = MOD_DIR and (MOD_DIR .. "/active_weapon.api") or nil
-local activeApiLastPayload = nil
-local apiRerollStatus = ""
-local apiRerollNonce = ""
-local apiRerollMessage = ""
+-- Dave now lives inside WeaponProgression and consumes progression state
+-- directly in memory. No active_weapon.api / reroll.request file bridge is used.
 
-local function api_clean(v)
-    if v == nil then return "" end
-    return tostring(v):gsub("[\t\r\n]", " ")
+local function gunsmith_snapshot()
+    if uiActive.weapon == nil or uiActive.weapon == "" then
+        return {
+            state = "none",
+            weapon = nil,
+            slot = uiActive.slot_tag,
+            reason = "no active weapon",
+        }
+    end
+
+    if uiActive.container == "CMelee" or
+       uiActive.slot_tag == "Jig.PlayerSlot.MeleeWeapon" or
+       uiActive.firearm ~= true then
+        return {
+            state = "none",
+            weapon = tostring(uiActive.weapon),
+            slot = uiActive.slot_tag,
+            reason = "active item is not a firearm",
+        }
+    end
+
+    if uiActive.uid == nil then
+        -- Reuse WeaponProgression's proven startup resolver. This covers saves
+        -- loaded with an already-held firearm before a weapon switch occurs.
+        pcall(function() ui_scan_startup_candidates() end)
+    end
+
+    if uiActive.uid == nil then
+        return {
+            state = "unresolved",
+            weapon = tostring(uiActive.weapon),
+            slot = uiActive.slot_tag,
+            reason = "physical weapon UID is still resolving",
+        }
+    end
+
+    local uid = uiActive.uid
+    local r = records[uid]
+    if r == nil then
+        return {
+            state = "untracked",
+            weapon = tostring(uiActive.weapon),
+            uid = uid,
+            slot = uiActive.slot_tag,
+        }
+    end
+
+    local level = math.max(1, math.floor(tonumber(r.level) or 1))
+    local currentRank = select(1, get_rank_info(level))
+    local rolls = 0
+    local stats = {}
+
+    r.bases = r.bases or {}
+    r.upgrades = r.upgrades or {}
+
+    for _, def in ipairs(STAT_DEFS) do
+        local count = math.max(0, math.floor(tonumber(r.upgrades[def.key]) or 0))
+        rolls = rolls + count
+
+        local base = tonumber(r.bases[def.key])
+        if base ~= nil then
+            local target = stat_target(def, base, count, r)
+            if target ~= nil then
+                stats[def.key] = {
+                    base = math.floor(base + 0.5),
+                    current = math.floor(target + 0.5),
+                    bonus = progression_bonus_label(def, base, target),
+                }
+            end
+        end
+    end
+
+    return {
+        state = "tracked",
+        weapon = tostring(r.weapon or uiActive.weapon or "Unknown"),
+        uid = uid,
+        slot = uiActive.slot_tag,
+        level = level,
+        xp = math.max(0, tonumber(r.xp) or 0),
+        kills = math.max(0, math.floor(tonumber(r.kills) or 0)),
+        rank = currentRank and tostring(currentRank.rank) or nil,
+        ordinary_rolls = rolls,
+        stats = stats,
+    }
 end
 
-write_active_weapon_api = function(reason)
-    if ACTIVE_API_PATH == nil then return false end
-
-    local state = ui_progression_state()
-    local uid = uiActive.uid
-    local r = uid and records[uid] or nil
-
-    local upgrades = (r and r.upgrades) or {}
-
-    local statsByKey = {}
-    for _, stat in ipairs(state.stats or {}) do
-        if stat.key ~= nil then statsByKey[stat.key] = stat end
-    end
-
-    local function stat_field(key, field)
-        local st = statsByKey[key]
-        if st == nil then return "" end
-        return st[field] or ""
-    end
-
-    local ordinaryRolls = 0
+local function gunsmith_copy_upgrade_counts(r)
+    local out = {}
+    r.upgrades = r.upgrades or {}
     for _, def in ipairs(STAT_DEFS) do
-        ordinaryRolls = ordinaryRolls + math.max(0, math.floor(tonumber(upgrades[def.key]) or 0))
+        out[def.key] = math.max(0, math.floor(tonumber(r.upgrades[def.key]) or 0))
     end
+    return out
+end
 
-    local lines = {
-        "version\t2",
-        "ready\t1",
-        "reason\t" .. api_clean(reason),
-        "weapon\t" .. api_clean(state.weapon or uiActive.weapon),
-        "firearm\t" .. ((uiActive.firearm == true) and "1" or "0"),
-        "slot_tag\t" .. api_clean(uiActive.slot_tag),
-        "container\t" .. api_clean(uiActive.container),
-        "uid\t" .. api_clean(uid),
-        "tracked\t" .. ((r ~= nil) and "1" or "0"),
-        "level\t" .. api_clean(r and math.max(1, math.floor(tonumber(r.level) or 1)) or ""),
-        "xp\t" .. api_clean(r and (tonumber(r.xp) or 0) or ""),
-        "xp_percent\t" .. api_clean(state.xp_percent),
-        "kills\t" .. api_clean(r and math.max(0, math.floor(tonumber(r.kills) or 0)) or ""),
-        "rank\t" .. api_clean(state.rank),
-        "ordinary_rolls\t" .. api_clean(ordinaryRolls),
-
-        "up_damage\t" .. api_clean(r and math.max(0, math.floor(tonumber(upgrades.damage) or 0)) or ""),
-        "up_critmult\t" .. api_clean(r and math.max(0, math.floor(tonumber(upgrades.critmult) or 0)) or ""),
-        "up_critchance\t" .. api_clean(r and math.max(0, math.floor(tonumber(upgrades.critchance) or 0)) or ""),
-        "up_rpm\t" .. api_clean(r and math.max(0, math.floor(tonumber(upgrades.rpm) or 0)) or ""),
-        "up_falloff\t" .. api_clean(r and math.max(0, math.floor(tonumber(upgrades.falloff) or 0)) or ""),
-
-        "base_damage\t" .. api_clean(stat_field("damage", "base")),
-        "current_damage\t" .. api_clean(stat_field("damage", "current")),
-        "bonus_damage\t" .. api_clean(stat_field("damage", "bonus")),
-
-        "base_critmult\t" .. api_clean(stat_field("critmult", "base")),
-        "current_critmult\t" .. api_clean(stat_field("critmult", "current")),
-        "bonus_critmult\t" .. api_clean(stat_field("critmult", "bonus")),
-
-        "base_critchance\t" .. api_clean(stat_field("critchance", "base")),
-        "current_critchance\t" .. api_clean(stat_field("critchance", "current")),
-        "bonus_critchance\t" .. api_clean(stat_field("critchance", "bonus")),
-
-        "base_rpm\t" .. api_clean(stat_field("rpm", "base")),
-        "current_rpm\t" .. api_clean(stat_field("rpm", "current")),
-        "bonus_rpm\t" .. api_clean(stat_field("rpm", "bonus")),
-
-        "base_falloff\t" .. api_clean(stat_field("falloff", "base")),
-        "current_falloff\t" .. api_clean(stat_field("falloff", "current")),
-        "bonus_falloff\t" .. api_clean(stat_field("falloff", "bonus")),
-
-        "reroll_status\t" .. api_clean(apiRerollStatus),
-        "reroll_nonce\t" .. api_clean(apiRerollNonce),
-        "reroll_message\t" .. api_clean(apiRerollMessage),
-    }
-    local payload = table.concat(lines, "\n") .. "\n"
-    if payload == activeApiLastPayload then return true end
-
-    local tmp = ACTIVE_API_PATH .. ".tmp"
-    local f = io.open(tmp, "w")
-    if not f then
-        log("ACTIVE API | write failed | " .. tostring(tmp))
-        return false
+local function gunsmith_upgrade_counts_equal(a, b)
+    for _, def in ipairs(STAT_DEFS) do
+        if (a[def.key] or 0) ~= (b[def.key] or 0) then
+            return false
+        end
     end
-    f:write(payload)
-    f:close()
-
-    os.remove(ACTIVE_API_PATH)
-    local ok, err = os.rename(tmp, ACTIVE_API_PATH)
-    if not ok then
-        log("ACTIVE API | promote failed | " .. tostring(err))
-        return false
-    end
-
-    activeApiLastPayload = payload
-    log("ACTIVE API | updated | weapon=" .. tostring(state.weapon) ..
-        " | uid=" .. tostring(uid) ..
-        " | level=" .. tostring(r and r.level or nil))
     return true
 end
 
-local function ui_scan_startup_candidates()
+local function gunsmith_generate_distribution(r, rollCount)
+    local eligible = {}
+    r.bases = r.bases or {}
+
+    for _, def in ipairs(STAT_DEFS) do
+        if r.bases[def.key] ~= nil then
+            eligible[#eligible + 1] = def
+        end
+    end
+
+    if #eligible == 0 then
+        return nil, nil, "No eligible captured firearm stats"
+    end
+    if rollCount <= 0 then
+        return nil, nil, "No ordinary progression rolls to reroll"
+    end
+
+    local counts = {}
+    for _, def in ipairs(STAT_DEFS) do
+        counts[def.key] = 0
+    end
+
+    local last = ""
+    for _ = 1, rollCount do
+        local choices = eligible
+
+        if Config.PreventConsecutiveSameStat and #eligible > 1 and last ~= "" then
+            choices = {}
+            for _, def in ipairs(eligible) do
+                if def.key ~= last then
+                    choices[#choices + 1] = def
+                end
+            end
+            if #choices == 0 then choices = eligible end
+        end
+
+        local chosen = choices[math.random(1, #choices)]
+        counts[chosen.key] = (counts[chosen.key] or 0) + 1
+        last = chosen.key
+    end
+
+    return counts, last, nil
+end
+
+local function gunsmith_reroll(uid)
+    if uid == nil or uid == "" then
+        return false, "No physical weapon UID was supplied"
+    end
+
+    -- Dave is only allowed to touch the firearm currently in the player's hand.
+    if uiActive.uid ~= uid then
+        return false, "The held weapon changed before reroll could be applied"
+    end
+
+    local r = records[uid]
+    if r == nil then
+        return false, "Weapon progression record not found"
+    end
+
+    local level = math.max(1, math.floor(tonumber(r.level) or 1))
+    if level < 5 then
+        return false, "Weapon must be Level 5 or higher"
+    end
+
+    local oldCounts = gunsmith_copy_upgrade_counts(r)
+    local rollCount = 0
+    for _, def in ipairs(STAT_DEFS) do
+        rollCount = rollCount + (oldCounts[def.key] or 0)
+    end
+
+    if rollCount <= 0 then
+        return false, "No ordinary progression bonuses are available to reroll"
+    end
+
+    local oldLast = r.last_upgrade or ""
+    local newCounts, newLast, err
+
+    -- Avoid returning an identical distribution where another outcome exists.
+    for _ = 1, 20 do
+        newCounts, newLast, err = gunsmith_generate_distribution(r, rollCount)
+        if newCounts == nil then
+            return false, err
+        end
+        if not gunsmith_upgrade_counts_equal(oldCounts, newCounts) then
+            break
+        end
+    end
+
+    if gunsmith_upgrade_counts_equal(oldCounts, newCounts) then
+        return false, "Reroll produced no different stat distribution"
+    end
+
+    r.upgrades = newCounts
+    r.last_upgrade = newLast or ""
+
+    if not save_db() then
+        r.upgrades = oldCounts
+        r.last_upgrade = oldLast
+        return false, "Database save failed; original progression was restored"
+    end
+
+    if reconcile_weapon_stats ~= nil then
+        reconcile_weapon_stats(uid, r.weapon, "gunsmith_reroll")
+    end
+
+    if uiActive.uid == uid then
+        ui_refresh_if_open()
+    end
+
+    log("GUNSMITH REROLL | SUCCESS | " .. tostring(r.weapon) ..
+        " | uid=" .. tostring(uid) ..
+        " | rolls=" .. tostring(rollCount))
+
+    return true, "Reroll successful"
+end
+
+ui_scan_startup_candidates = function()
     if uiActive.uid ~= nil or uiActive.weapon == nil then return false end
 
     local okFind, slots = pcall(function() return FindAllOf(JSI_SLOT_CLASS) end)
@@ -1847,54 +1954,6 @@ local function ui_scan_startup_candidates()
             " | waiting for active slot callback")
     end
     return false
-end
-
--- Eager startup/bootstrap resolver for saves loaded with a weapon already held.
--- Weapon switches naturally populate the UID through callbacks; this fills the
--- gap when the game starts with an already-equipped firearm and no switch occurs.
-local uiBootstrapGeneration = 0
-
-ui_bootstrap_active_uid = function(reason)
-    if uiActive.uid ~= nil or uiActive.weapon == nil or uiActive.slot_tag == nil then
-        return
-    end
-
-    uiBootstrapGeneration = uiBootstrapGeneration + 1
-    local generation = uiBootstrapGeneration
-
-    local function attempt(round)
-        if generation ~= uiBootstrapGeneration then return end
-        if uiActive.uid ~= nil then return end
-        if uiActive.weapon == nil or uiActive.slot_tag == nil then return end
-
-        local resolved = ui_scan_startup_candidates()
-
-        if resolved or uiActive.uid ~= nil then
-            log("UI BOOTSTRAP | resolved active UID | reason=" .. tostring(reason) ..
-                " | weapon=" .. tostring(uiActive.weapon) ..
-                " | uid=" .. tostring(uiActive.uid))
-
-            if write_active_weapon_api ~= nil then
-                write_active_weapon_api("bootstrap_resolved")
-            end
-            return
-        end
-
-        if round < 12 then
-            ExecuteWithDelay(250, function()
-                attempt(round + 1)
-            end)
-        else
-            log("UI BOOTSTRAP | UID still unresolved after retries | weapon=" ..
-                tostring(uiActive.weapon) .. " | slot=" .. tostring(uiActive.slot_tag))
-
-            if write_active_weapon_api ~= nil then
-                write_active_weapon_api("bootstrap_unresolved")
-            end
-        end
-    end
-
-    attempt(1)
 end
 
 local function ui_on_get_active_weapon(Context, ActiveWeapon, ...)
@@ -2416,183 +2475,6 @@ process_pending_rewards = function(uid, weaponName)
     save_db()
 end
 
-
--- ============================================================================
--- Gunsmith reroll command service (research/dev)
--- ============================================================================
--- Cross-mod command file. NPCResearch may REQUEST a reroll, but only
--- WeaponProgression mutates the authoritative record and live stats.
-local REROLL_REQUEST_PATH = MOD_DIR and (MOD_DIR .. "/reroll.request") or nil
-local rerollPollGeneration = 0
-
-local function copy_upgrade_counts(r)
-    local out = {}
-    r.upgrades = r.upgrades or {}
-    for _, def in ipairs(STAT_DEFS) do
-        out[def.key] = math.max(0, math.floor(tonumber(r.upgrades[def.key]) or 0))
-    end
-    return out
-end
-
-local function upgrade_counts_equal(a, b)
-    for _, def in ipairs(STAT_DEFS) do
-        if (a[def.key] or 0) ~= (b[def.key] or 0) then return false end
-    end
-    return true
-end
-
-local function generate_reroll_distribution(r, rollCount)
-    local eligible = {}
-    r.bases = r.bases or {}
-
-    for _, def in ipairs(STAT_DEFS) do
-        if r.bases[def.key] ~= nil then eligible[#eligible + 1] = def end
-    end
-
-    if #eligible == 0 then return nil, nil, "No eligible captured firearm stats" end
-    if rollCount <= 0 then return nil, nil, "No ordinary progression rolls to reroll" end
-
-    local counts = {}
-    for _, def in ipairs(STAT_DEFS) do counts[def.key] = 0 end
-
-    local last = ""
-    for _ = 1, rollCount do
-        local choices = eligible
-
-        if Config.PreventConsecutiveSameStat and #eligible > 1 and last ~= "" then
-            choices = {}
-            for _, def in ipairs(eligible) do
-                if def.key ~= last then choices[#choices + 1] = def end
-            end
-            if #choices == 0 then choices = eligible end
-        end
-
-        local chosen = choices[math.random(1, #choices)]
-        counts[chosen.key] = (counts[chosen.key] or 0) + 1
-        last = chosen.key
-    end
-
-    return counts, last, nil
-end
-
-local function reroll_record(uid, nonce)
-    local r = records[uid]
-    if r == nil then
-        return false, "WeaponProgression record not found"
-    end
-
-    local level = math.max(1, math.floor(tonumber(r.level) or 1))
-    if level < 5 then
-        return false, "Weapon must be Level 5 or higher"
-    end
-
-    local oldCounts = copy_upgrade_counts(r)
-    local rollCount = 0
-    for _, def in ipairs(STAT_DEFS) do rollCount = rollCount + (oldCounts[def.key] or 0) end
-
-    if rollCount <= 0 then
-        return false, "No ordinary progression rolls are available"
-    end
-
-    local oldLast = r.last_upgrade or ""
-    local newCounts, newLast, err = nil, nil, nil
-
-    -- Avoid a visually pointless identical reroll where alternatives exist.
-    for _ = 1, 20 do
-        newCounts, newLast, err = generate_reroll_distribution(r, rollCount)
-        if newCounts == nil then return false, err end
-        if not upgrade_counts_equal(oldCounts, newCounts) then break end
-    end
-
-    if upgrade_counts_equal(oldCounts, newCounts) then
-        return false, "Reroll produced no different stat distribution"
-    end
-
-    r.upgrades = newCounts
-    r.last_upgrade = newLast or ""
-
-    local saved = save_db()
-    if not saved then
-        r.upgrades = oldCounts
-        r.last_upgrade = oldLast
-        return false, "Database save failed; original progression was restored"
-    end
-
-    if reconcile_weapon_stats ~= nil then
-        reconcile_weapon_stats(uid, r.weapon, "gunsmith_reroll")
-    end
-
-    log("GUNSMITH REROLL | SUCCESS | " .. tostring(r.weapon) ..
-        " | uid=" .. tostring(uid) ..
-        " | rolls=" .. tostring(rollCount) ..
-        " | nonce=" .. tostring(nonce))
-
-    return true, "Reroll successful"
-end
-
-local function read_reroll_request()
-    if REROLL_REQUEST_PATH == nil then return nil end
-    local f = io.open(REROLL_REQUEST_PATH, "r")
-    if not f then return nil end
-
-    local data = {}
-    for line in f:lines() do
-        local tab = line:find("\t", 1, true)
-        if tab then data[line:sub(1, tab - 1)] = line:sub(tab + 1) end
-    end
-    f:close()
-    os.remove(REROLL_REQUEST_PATH)
-    return data
-end
-
-local function process_reroll_request()
-    local req = read_reroll_request()
-    if req == nil then return end
-
-    local uid = req.uid
-    local nonce = req.nonce or ""
-
-    apiRerollNonce = nonce
-    apiRerollStatus = "processing"
-    apiRerollMessage = "Rerolling..."
-    write_active_weapon_api("reroll_processing")
-
-    if uid == nil or uid == "" then
-        apiRerollStatus = "error"
-        apiRerollMessage = "Reroll request did not contain a weapon UID"
-        write_active_weapon_api("reroll_error")
-        return
-    end
-
-    if uiActive.uid ~= uid then
-        apiRerollStatus = "error"
-        apiRerollMessage = "The held weapon changed before reroll could be applied"
-        write_active_weapon_api("reroll_error")
-        return
-    end
-
-    local ok, message = reroll_record(uid, nonce)
-    apiRerollStatus = ok and "success" or "error"
-    apiRerollMessage = message or (ok and "Reroll successful" or "Reroll failed")
-    write_active_weapon_api(ok and "reroll_success" or "reroll_error")
-end
-
-local function arm_reroll_request_poll()
-    rerollPollGeneration = rerollPollGeneration + 1
-    local generation = rerollPollGeneration
-
-    local function tick()
-        if generation ~= rerollPollGeneration then return end
-        ExecuteInGameThread(function()
-            if generation ~= rerollPollGeneration then return end
-            process_reroll_request()
-            ExecuteWithDelay(200, tick)
-        end)
-    end
-
-    ExecuteWithDelay(200, tick)
-end
-
 local function award_kill(uid, weaponName, vanillaXP)
     if uid == nil or vanillaXP == nil or vanillaXP <= 0 then return end
     local r=ensure_record(uid,weaponName)
@@ -2641,12 +2523,7 @@ local function award_kill(uid, weaponName, vanillaXP)
     end
 
     -- If this is the weapon currently displayed, update Level / XP immediately.
-    if uiActive.uid == uid then
-        ui_refresh_if_open()
-        if write_active_weapon_api ~= nil then
-            write_active_weapon_api("progression_update")
-        end
-    end
+    if uiActive.uid == uid then ui_refresh_if_open() end
 end
 
 -- ============================================================================
@@ -2829,6 +2706,10 @@ end
 -- BP_StatW widgets are constructed, so this gives their Construct hook a safe,
 -- read-only lookup of the persisted enhancement for the weapon being rendered.
 local tooltipBonusContext = nil
+
+-- Extra Level / XP / Kills / Rank rows require creating additional tooltip
+-- widgets and have caused native access violations on some UE4SS builds.
+-- Disabled by default through config.ini; F8 remains the detailed progression view.
 
 local function display_number(v)
     local n = tonumber(v)
@@ -3019,12 +2900,18 @@ local function add_progression_rows(tooltip, r, weaponName)
 end
 
 local function on_tooltip_update(Context, ItemRefParam, ...)
+    -- v0.18.2-dev2 diagnostic:
+    -- Keep the tooltip path one-way with respect to FText. We may CREATE FText
+    -- later for our own rows/values, but do not read/convert live tooltip FText.
     tooltipBonusContext = nil
+    log("TOOLTIP DIAG | ENTER")
+
     local slot = unwrap(ItemRefParam)
     if slot == nil then
-        log("TOOLTIP PROBE | ItemRef=<nil>")
+        log("TOOLTIP DIAG | ABORT | reason=ItemRef_nil")
         return
     end
+    log("TOOLTIP DIAG | SLOT OK | slot=" .. full_name(slot))
 
     local uidStruct = nil
     local okUid, rawUid = pcall(function() return slot[FIELDS.item_unique_id] end)
@@ -3035,37 +2922,33 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
     local statsCount = nil
     pcall(function() statsCount = safe_array_length(slot["ItemStats"]) end)
 
+    -- IMPORTANT: do not call slot:GetItemName() here. That returns FText on this
+    -- path and converting arbitrary live FText is a suspected native-crash edge
+    -- on some UE4SS builds. short_name() is UObject-name based and safe enough
+    -- for diagnostics; tracked weapons prefer the persisted DB weapon name.
     local itemName = short_name(slot)
-    local okName, nameValue = pcall(function() return slot:GetItemName() end)
-    if okName and nameValue ~= nil then
-        local rawName = unwrap(nameValue)
-        local okText, txt = pcall(function() return rawName:ToString() end)
-        if okText and txt ~= nil and tostring(txt) ~= "" then itemName = tostring(txt) end
-    end
 
     if uid == nil then
         log(string.format(
-            "TOOLTIP PROBE | item=%s | uid=<unresolved> | ItemStats=%s | slot=%s",
+            "TOOLTIP DIAG | UID UNRESOLVED | item=%s | ItemStats=%s | slot=%s",
             tostring(itemName), tostring(statsCount or "?"), full_name(slot)
         ))
         return
     end
+    log("TOOLTIP DIAG | UID OK | uid=" .. tostring(uid) .. " | item=" .. tostring(itemName))
 
     local r = records[uid]
     if r ~= nil then
+        if r.weapon ~= nil and tostring(r.weapon) ~= "" then
+            itemName = tostring(r.weapon)
+        end
+
         local needed = xp_required(r.level or 1)
         log(string.format(
-            "TOOLTIP PROBE | item=%s | uid=%s | ItemStats=%s | record=FOUND | L%d %.3f/%d XP | kills=%d",
+            "TOOLTIP DIAG | RECORD FOUND | item=%s | uid=%s | ItemStats=%s | L%d %.3f/%d XP | kills=%d",
             tostring(itemName), uid, tostring(statsCount or "?"),
             math.floor(r.level or 1), tonumber(r.xp or 0) or 0, needed, math.floor(r.kills or 0)
         ))
-
-        -- DB v2 stores bases/upgrades in nested tables. Prefer the persisted
-        -- weapon name when GetItemName() exposes a generic UI label such as
-        -- "Inventory" through the tooltip callback.
-        if (itemName == nil or itemName == "" or itemName == "Inventory") and r.weapon ~= nil then
-            itemName = tostring(r.weapon)
-        end
 
         local liveStats = {}
         local arr = nil
@@ -3091,8 +2974,8 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
             weapon = tostring(itemName),
             record = r,
             by_tag = {},
-            by_label = {},
         }
+
         for _, def in ipairs(STAT_DEFS) do
             local base = tonumber(r.bases[def.key])
             local count = math.floor(tonumber(r.upgrades[def.key]) or 0)
@@ -3120,20 +3003,16 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
                 end
             end
         end
-        if #parts > 0 then
-            log("TOOLTIP UPGRADES | " .. itemName .. " | " .. table.concat(parts, " ; "))
-        else
-            log("TOOLTIP UPGRADES | " .. itemName .. " | none recorded")
-        end
+
+        log("TOOLTIP DIAG | CONTEXT BUILT | weapon=" .. tostring(itemName) ..
+            " | tracked_stats=" .. tostring(#parts))
     else
         log(string.format(
-            "TOOLTIP PROBE | item=%s | uid=%s | ItemStats=%s | record=NOT_FOUND",
+            "TOOLTIP DIAG | RECORD NOT FOUND | item=%s | uid=%s | ItemStats=%s",
             tostring(itemName), uid, tostring(statsCount or "?")
         ))
     end
 
-    -- Update is a pre-hook; vanilla creates its BP_StatW/BP_StatTextW children
-    -- immediately afterwards. Inspect the finished UniformGrid shortly later.
     local tooltipContext = unwrap(Context)
     ExecuteWithDelay(75, function()
         local valid = false
@@ -3143,13 +3022,21 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
         if valid then
             local ctx = tooltipBonusContext
             if ctx ~= nil and ctx.record ~= nil then
-                add_progression_rows(tooltipContext, ctx.record, ctx.weapon)
+                if Config.ShowProgressionTooltipRows then
+                    log("TOOLTIP DIAG | BEFORE PROGRESSION ROWS | weapon=" .. tostring(ctx.weapon))
+                    add_progression_rows(tooltipContext, ctx.record, ctx.weapon)
+                    log("TOOLTIP DIAG | AFTER PROGRESSION ROWS | weapon=" .. tostring(ctx.weapon))
+                else
+                    log("TOOLTIP DIAG | PROGRESSION ROWS SKIPPED | weapon=" .. tostring(ctx.weapon) ..
+                        " | disabled for compatibility | use F8 for Level/XP/Kills/Rank")
+                end
             end
         else
-            log("TEXT GRID PROBE | tooltip no longer valid after delay")
+            log("TOOLTIP DIAG | DELAY ABORT | tooltip no longer valid")
         end
     end)
 
+    log("TOOLTIP DIAG | UPDATE COMPLETE | item=" .. tostring(itemName))
 end
 
 
@@ -3160,29 +3047,27 @@ end
 local PATH_STAT_W_CONSTRUCT =
     "/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C:Construct"
 
+local TOOLTIP_UNIT_BY_TAG = {
+    ["Jig.Stat.FirearmDamage"] = "",
+    ["Jig.Stat.CriticalHitMultiplier"] = "%",
+    ["Jig.Stat.CriticalHitChance"] = "%",
+    ["Jig.Stat.FirearmRPM"] = "",
+    ["Jig.Stat.DamageFallOff"] = " M",
+}
+
 local function on_stat_w_construct(Context, ...)
+    -- v0.18.2-dev2 safety rule:
+    -- Do not touch unrelated stat widgets, and do not READ any live FText.
+    -- Match the row only by its GameplayTag, calculate the display from our
+    -- authoritative numeric context, then CREATE fresh FText for SetText().
+    local ctx = tooltipBonusContext
+    if ctx == nil or ctx.record == nil then return end
+
     local w = unwrap(Context)
     if w == nil then
-        log("STAT W CONSTRUCT | context=<nil>")
+        log("TOOLTIP DIAG | STAT ROW ABORT | weapon=" .. tostring(ctx.weapon) .. " | reason=context_nil")
         return
     end
-
-    local parts = {}
-    for _, f in ipairs({
-        "StatName", "VectValue", "Prefix", "ExtraText",
-        "TextBlock", "TextBlock_56", "PrefixTxt", "ExtraTxt"
-    }) do
-        local v = field_text(w, f)
-        if v ~= nil and v ~= "" then
-            parts[#parts + 1] = f .. "=" .. v
-        end
-    end
-
-    log("STAT W CONSTRUCT | widget=" .. full_name(w) ..
-        " | " .. (#parts > 0 and table.concat(parts, " ; ") or "<no readable fields>"))
-
-    local ctx = tooltipBonusContext
-    if ctx == nil then return end
 
     local tagName = nil
     local rawStatName, statNameOk = safe_field(w, "StatName")
@@ -3190,69 +3075,65 @@ local function on_stat_w_construct(Context, ...)
         pcall(function() tagName = decode_gameplay_tag(unwrap(rawStatName)) end)
     end
 
-    local label = field_text(w, "TextBlock_56")
-    local labelToTag = {
-        ["Damage"] = "Jig.Stat.FirearmDamage",
-        ["Critical Hit Multiplier"] = "Jig.Stat.CriticalHitMultiplier",
-        ["Critical Hit Chance"] = "Jig.Stat.CriticalHitChance",
-        ["RPM"] = "Jig.Stat.FirearmRPM",
-        ["Damage Falloff Range"] = "Jig.Stat.DamageFallOff",
-    }
-    if tagName == nil or ctx.by_tag[tagName] == nil then
-        tagName = labelToTag[label]
-    end
+    log("TOOLTIP DIAG | STAT ROW ENTER | weapon=" .. tostring(ctx.weapon) ..
+        " | tag=" .. tostring(tagName or "<unresolved>"))
 
     if tagName == nil then
-        log("TOOLTIP FORMAT NO MATCH | " .. tostring(ctx.weapon) ..
-            " | label=" .. tostring(label))
+        log("TOOLTIP DIAG | STAT ROW SKIP | weapon=" .. tostring(ctx.weapon) ..
+            " | reason=tag_unresolved")
         return
     end
+
     local statInfo = ctx.by_tag[tagName]
+    if type(statInfo) ~= "table" then
+        log("TOOLTIP DIAG | STAT ROW SKIP | weapon=" .. tostring(ctx.weapon) ..
+            " | tag=" .. tostring(tagName) .. " | reason=not_progression_stat")
+        return
+    end
+
+    local effective = tonumber(statInfo.target)
+    if effective == nil then
+        log("TOOLTIP DIAG | STAT ROW SKIP | weapon=" .. tostring(ctx.weapon) ..
+            " | tag=" .. tostring(tagName) .. " | reason=target_nil")
+        return
+    end
 
     local valueBlock = nil
     pcall(function() valueBlock = unwrap(w["TextBlock"]) end)
-    local currentText = textblock_text(valueBlock)
-    if valueBlock == nil or currentText == nil then
-        log("TOOLTIP FORMAT SKIP | " .. tostring(ctx.weapon) ..
-            " | label=" .. tostring(label) .. " | reason=value_text_unavailable")
+    if valueBlock == nil then
+        log("TOOLTIP DIAG | STAT ROW SKIP | weapon=" .. tostring(ctx.weapon) ..
+            " | tag=" .. tostring(tagName) .. " | reason=value_block_nil")
         return
     end
 
-    local currentNumber = tonumber(tostring(trim(currentText):gsub(",", "")))
-    if currentNumber == nil then
-        log("TOOLTIP FORMAT SKIP | " .. tostring(ctx.weapon) ..
-            " | label=" .. tostring(label) .. " | reason=non_numeric_value " .. tostring(currentText))
-        return
-    end
-
-    local unit = field_text(w, "ExtraText") or field_text(w, "ExtraTxt") or ""
-    if unit == "None" then unit = "" end
-    -- Vanilla builds this row from its own value. For progressed weapons show
-    -- WeaponProgression's deterministic effective target instead, rounded to
-    -- whole numbers so the player sees the stat the weapon actually has.
-    local effective = (type(statInfo) == "table" and tonumber(statInfo.target)) or currentNumber
-    local rendered = display_integer(effective) .. unit_suffix(unit)
-    local suffix = type(statInfo) == "table" and statInfo.bonus_label or nil
+    local rendered = display_integer(effective) .. (TOOLTIP_UNIT_BY_TAG[tagName] or "")
+    local suffix = statInfo.bonus_label
     if suffix ~= nil then
-        rendered = rendered .. " (" .. suffix .. ")"
+        rendered = rendered .. " (" .. tostring(suffix) .. ")"
     end
+
+    log("TOOLTIP DIAG | BEFORE ROW WRITE | weapon=" .. tostring(ctx.weapon) ..
+        " | tag=" .. tostring(tagName) .. " | rendered=" .. tostring(rendered))
 
     local okSet, setErr = set_textblock_text(valueBlock, rendered)
+    if not okSet then
+        log("TOOLTIP DIAG | ROW WRITE FAILED | weapon=" .. tostring(ctx.weapon) ..
+            " | tag=" .. tostring(tagName) .. " | error=" .. tostring(setErr))
+        return
+    end
 
-    -- We folded % / M into the value text so clear vanilla's separate unit widget.
-    if unit ~= "" then
+    -- Vanilla may render a separate unit widget. We do not READ it. For rows
+    -- whose unit is now folded into our value, clear ExtraTxt using fresh FText.
+    if (TOOLTIP_UNIT_BY_TAG[tagName] or "") ~= "" then
         local extraBlock = nil
         pcall(function() extraBlock = unwrap(w["ExtraTxt"]) end)
-        if extraBlock ~= nil then set_textblock_text(extraBlock, "") end
+        if extraBlock ~= nil then
+            set_textblock_text(extraBlock, "")
+        end
     end
 
-    if okSet then
-        log("TOOLTIP FORMAT APPLY | " .. tostring(ctx.weapon) ..
-            " | " .. tostring(label or tagName) .. " | " .. rendered)
-    else
-        log("TOOLTIP FORMAT FAILED | " .. tostring(ctx.weapon) ..
-            " | " .. tostring(label or tagName) .. " | " .. tostring(setErr))
-    end
+    log("TOOLTIP DIAG | ROW WRITE OK | weapon=" .. tostring(ctx.weapon) ..
+        " | tag=" .. tostring(tagName))
 end
 
 local function on_inventory_add_cache_invalidate(Context, LocalCompParam, ItemIdParam, CountParam, AddedParam, UIDParam, ...)
@@ -3352,11 +3233,6 @@ local function try_register_hooks()
         if Compatibility ~= nil then Compatibility.Summarize() end
         log("All " .. tostring(#hooks) .. " hooks active.")
         log("Ready: configurable progression is active.")
-
-        if ui_bootstrap_active_uid ~= nil then
-            ui_bootstrap_active_uid("all_hooks_ready")
-        end
-
         log("Persistent progression armed: first resolved use captures base stats; each level-up awards and stores one stat upgrade.")
         return
     end
@@ -3408,6 +3284,45 @@ local function try_register_hooks()
     end
 end
 
+
+local Gunsmith = nil
+
+local function load_integrated_gunsmith()
+    local path = MOD_DIR .. "/Scripts/gunsmith.lua"
+    local okLoad, chunkOrErr = pcall(loadfile, path)
+    if not okLoad or chunkOrErr == nil then
+        log("GUNSMITH LOAD FAILED | " .. tostring(chunkOrErr))
+        return false
+    end
+
+    local okRun, moduleOrErr = pcall(chunkOrErr)
+    if not okRun or type(moduleOrErr) ~= "table" then
+        log("GUNSMITH LOAD FAILED | " .. tostring(moduleOrErr))
+        return false
+    end
+
+    Gunsmith = moduleOrErr
+
+    local okInit, initErr = pcall(function()
+        Gunsmith.Init({
+            GetSnapshot = gunsmith_snapshot,
+            Reroll = gunsmith_reroll,
+            Log = function(msg)
+                log("GUNSMITH | " .. tostring(msg))
+            end,
+        })
+    end)
+
+    if not okInit then
+        log("GUNSMITH INIT FAILED | " .. tostring(initErr))
+        Gunsmith = nil
+        return false
+    end
+
+    log("GUNSMITH INTEGRATED | direct in-memory progression API active")
+    return true
+end
+
 log("----------------------------------------------------------------")
 log("WeaponProgression v" .. VERSION)
 log("XP/database/stat writes ENABLED; persistent stat progression ACTIVE; v0.15.1 utility safeguards retained.")
@@ -3417,18 +3332,14 @@ log("PERSISTENT STAT PROGRESSION | Primary + Secondary + Sidearm | inventory pic
 log("NATIVE TOOLTIP REQUESTED | rounded effective stats, inline progression bonuses, and Level / XP% / Kills / mastery rows.")
 log("COMPATIBILITY GUARD ACTIVE | tooltip hooks are attempted only after their expected Blueprint classes/UFunctions are present; game version is logged diagnostically.")
 log("REUSABLE NATIVE UI ACTIVE | mastery rank + next milestone | XP bar | 3s auto-close reset by weapon switch.")
-arm_reroll_request_poll()
-log("GUNSMITH REROLL API ACTIVE | free research rerolls via reroll.request")
 log("MASTERY MILESTONES ACTIVE | config.ini-driven fixed bonuses + cumulative caps | deterministic reconstruction from weapon level.")
+log("INTEGRATED GUNSMITH ACTIVE | Dave spawns at the Safe Zone test location; F6 respawns, F7 removes; rerolls use direct in-memory progression state.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())
 load_config()
 load_db()
-
-if write_active_weapon_api ~= nil then
-    write_active_weapon_api("startup")
-end
+load_integrated_gunsmith()
 
 if UI ~= nil then
     local okKeybind, keybindErr = pcall(function()

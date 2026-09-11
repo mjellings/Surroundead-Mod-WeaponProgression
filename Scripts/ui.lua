@@ -1,6 +1,6 @@
 -- ============================================================================
 -- WeaponProgression UI module
--- v0.17.0-dev2 effective-stat mastery status-card layout
+-- v0.18.0 effective-stat mastery status-card layout
 -- Presentation only: no gameplay hooks, GUID logic, DB access or XP formulas.
 -- ============================================================================
 
