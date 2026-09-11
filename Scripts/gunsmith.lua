@@ -1,5 +1,5 @@
 -- ============================================================================
--- WeaponProgression Integrated Gunsmith (Dave) - v0.18.4-dev1
+-- WeaponProgression Integrated Gunsmith (Dave) - v0.18.4-dev8
 --
 -- Uses direct in-memory callbacks supplied by WeaponProgression/main.lua.
 -- No active_weapon.api or reroll.request files.
@@ -544,7 +544,7 @@ end
 
 
 local destroy_spawned
-local spawn_safe_zone
+local spawn_test_location
 
 local function lower_and_respawn(amount)
     amount = tonumber(amount) or 10.0
@@ -609,7 +609,7 @@ destroy_spawned = function(reason)
     spawned = nil
 end
 
-spawn_safe_zone = function()
+spawn_test_location = function()
     if valid(spawned) then return true end
 
     local player = local_player()
