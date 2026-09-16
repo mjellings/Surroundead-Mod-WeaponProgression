@@ -1,5 +1,5 @@
 -- ============================================================================
--- WeaponProgression Integrated Gunsmith (Dave) - v0.18.4-dev8
+-- WeaponProgression Integrated Gunsmith (Dave) - v0.18.4-dev9
 --
 -- Uses direct in-memory callbacks supplied by WeaponProgression/main.lua.
 -- No active_weapon.api or reroll.request files.
@@ -73,8 +73,19 @@ local NO_FIREARM_CLOSE_MS = 3000
 
 local api = nil
 local ui = nil
-local spawned = nil
+
+-- IMPORTANT:
+-- Do not keep Dave's UObject wrapper around long-term. UE4SS wrappers can outlive
+-- the underlying native UObject; touching a stale wrapper can native-crash inside
+-- UStruct::FindProperty before Lua pcall can protect us.
+--
+-- Keep only Dave's full object name and reacquire a fresh live UObject from
+-- FindAllOf("BP_QuestGiver_C") whenever we need to interact with him.
+local spawnedObjectName = nil
+
 local hookRegistered = false
+local recoveryHooksRegistered = false
+local recoveryCheckArmed = true
 local spawnGeneration = 0
 local proximityGeneration = 0
 local uiAutoCloseGeneration = 0
@@ -111,6 +122,27 @@ local function full_name(o)
     if not valid(o) then return "<invalid>" end
     local ok, v = pcall(function() return o:GetFullName() end)
     return ok and tostring(v) or tostring(o)
+end
+
+local function find_live_dave()
+    if spawnedObjectName == nil then return nil end
+
+    local ok, actors = pcall(function()
+        return FindAllOf("BP_QuestGiver_C")
+    end)
+    if not ok or type(actors) ~= "table" then return nil end
+
+    for _, candidate in ipairs(actors) do
+        candidate = unwrap(candidate)
+        if valid(candidate) then
+            local candidateName = full_name(candidate)
+            if candidateName == spawnedObjectName then
+                return candidate
+            end
+        end
+    end
+
+    return nil
 end
 
 local function local_player()
@@ -444,8 +476,9 @@ local function begin_proximity_watch()
             if generation ~= proximityGeneration then return end
             if not ui_is_open() then return end
 
-            if not valid(spawned) then
-                log("UI | close: Dave no longer valid")
+            local liveDave = find_live_dave()
+            if not valid(liveDave) then
+                log("UI | close: Dave no longer live")
                 hide_ui()
                 return
             end
@@ -456,7 +489,7 @@ local function begin_proximity_watch()
                 return
             end
 
-            local d = distance_between(player, spawned)
+            local d = distance_between(player, liveDave)
             if d ~= nil and d > UI_CLOSE_DISTANCE then
                 log(string.format("UI | proximity close | distance=%.1f", d))
                 hide_ui()
@@ -519,11 +552,11 @@ local function register_handoff_hook()
     local ok, a, b = pcall(function()
         return RegisterHook(path, function(ctx, ...)
             local actor = unwrap_context(ctx)
-            if not valid(actor) or not valid(spawned) then return end
+            if not valid(actor) or spawnedObjectName == nil then return end
 
-            -- Compare UObject full names because UE4SS can expose separate Lua
-            -- wrappers for the same underlying actor.
-            if full_name(actor) ~= full_name(spawned) then return end
+            -- Compare against the safe stored object-name string. Do not dereference
+            -- a long-lived cached UObject wrapper here.
+            if full_name(actor) ~= spawnedObjectName then return end
 
             ExecuteInGameThread(function()
                 show_gunsmith_ui()
@@ -582,8 +615,14 @@ destroy_spawned = function(reason)
     hide_ui()
     spawnGeneration = spawnGeneration + 1
 
-    if valid(spawned) then
-        local old = spawned
+    local oldName = spawnedObjectName
+    local old = find_live_dave()
+
+    -- Clear the identity before destruction so no later callback can treat the
+    -- old actor as current Dave.
+    spawnedObjectName = nil
+
+    if valid(old) then
         log("DEV | destroy Dave | reason=" .. tostring(reason or "manual") ..
             " | actor=" .. full_name(old))
 
@@ -603,14 +642,21 @@ destroy_spawned = function(reason)
             log("DEV | destroy requested")
         end
     else
-        log("DEV | destroy requested but Dave is not currently valid")
+        log("DEV | destroy requested but Dave is not currently live" ..
+            (oldName and (" | last_actor=" .. tostring(oldName)) or ""))
     end
-
-    spawned = nil
 end
 
 spawn_test_location = function()
-    if valid(spawned) then return true end
+    local existing = find_live_dave()
+    if valid(existing) then return true end
+
+    -- If our previous identity no longer resolves, forget it and create a fresh Dave.
+    if spawnedObjectName ~= nil then
+        log("SPAWN RECOVERY | previous Dave no longer live | actor=" ..
+            tostring(spawnedObjectName))
+        spawnedObjectName = nil
+    end
 
     local player = local_player()
     if not valid(player) then return false end
@@ -640,21 +686,31 @@ spawn_test_location = function()
         Roll = tonumber(spot.Roll) or 0.0,
     }
 
+    local newDave = nil
     local ok, err = pcall(function()
-        spawned = world:SpawnActor(cls, loc, rot)
+        newDave = unwrap(world:SpawnActor(cls, loc, rot))
     end)
 
-    if not ok or not valid(spawned) then
-        spawned = nil
+    if not ok or not valid(newDave) then
+        spawnedObjectName = nil
         log("SPAWN FAILED | " .. tostring(err))
         return false
     end
 
-    set_native_name(spawned, "Dave")
+    set_native_name(newDave, "Dave")
+
+    local newName = full_name(newDave)
+    if newName == "<invalid>" then
+        spawnedObjectName = nil
+        log("SPAWN FAILED | spawned actor did not remain valid long enough to identify")
+        return false
+    end
+
+    spawnedObjectName = newName
 
     log(string.format(
         "SPAWN SUCCESS | %s | location=%s | index=%d | X=%.1f Y=%.1f Z=%.1f Yaw=%.1f | baseZ=%.1f | zOffset=%.1f | devZOffset=%.1f",
-        full_name(spawned),
+        spawnedObjectName,
         tostring(spot.Name or ("Location " .. tostring(LOCATION_CONFIG.TestLocation))),
         LOCATION_CONFIG.TestLocation,
         tonumber(spot.X) or 0.0,
@@ -698,6 +754,82 @@ local function arm_spawn_retry()
     end
 
     ExecuteWithDelay(2500, try_spawn)
+end
+
+local function ensure_dave_exists(reason)
+    local liveDave = find_live_dave()
+    if valid(liveDave) then
+        return true
+    end
+
+    log("ENSURE | Dave missing | reason=" .. tostring(reason or "runtime"))
+
+    if spawn_test_location() then
+        log("ENSURE | Dave recovered | reason=" .. tostring(reason or "runtime") ..
+            " | actor=" .. tostring(spawnedObjectName))
+        return true
+    end
+
+    log("ENSURE | recovery spawn not ready | reason=" .. tostring(reason or "runtime"))
+    return false
+end
+
+local function runtime_recovery_check(reason)
+    -- Firearm damage can happen rapidly. At most one runtime recovery scan/spawn
+    -- is allowed per 5-second window.
+    if not recoveryCheckArmed then return end
+    recoveryCheckArmed = false
+
+    ExecuteWithDelay(5000, function()
+        recoveryCheckArmed = true
+    end)
+
+    ExecuteInGameThread(function()
+        ensure_dave_exists(reason)
+    end)
+end
+
+local function register_recovery_hooks()
+    if recoveryHooksRegistered then return true end
+
+    local registered = 0
+
+    local firearmPath =
+        "/Game/Inventory/Items/Pickups/Weapons/Firearms/BP_FirearmPickup.BP_FirearmPickup_C:SERVER_DamageEvent"
+
+    local okFire, fireA, fireB = pcall(function()
+        return RegisterHook(firearmPath, function(...)
+            runtime_recovery_check("firearm damage")
+        end)
+    end)
+
+    if okFire then
+        registered = registered + 1
+        log("RECOVERY HOOK READY | firearm damage | ids=" ..
+            tostring(fireA) .. "," .. tostring(fireB))
+    else
+        log("RECOVERY HOOK FAILED | firearm damage | " .. tostring(fireA))
+    end
+
+    local deathPath =
+        "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C:Death"
+
+    local okDeath, deathA, deathB = pcall(function()
+        return RegisterHook(deathPath, function(...)
+            runtime_recovery_check("zombie death")
+        end)
+    end)
+
+    if okDeath then
+        registered = registered + 1
+        log("RECOVERY HOOK READY | zombie death | ids=" ..
+            tostring(deathA) .. "," .. tostring(deathB))
+    else
+        log("RECOVERY HOOK FAILED | zombie death | " .. tostring(deathA))
+    end
+
+    recoveryHooksRegistered = registered > 0
+    return recoveryHooksRegistered
 end
 
 local function register_controls()
@@ -788,6 +920,7 @@ function M.Init(callbacks)
 
     load_ui()
     register_controls()
+    register_recovery_hooks()
     arm_spawn_retry()
 
     log("INTEGRATED READY | direct in-memory WeaponProgression access")
@@ -798,6 +931,7 @@ function M.Init(callbacks)
         " | rawZ=" .. tostring(selected.Z) ..
         " | ZOffset=" .. tostring(LOCATION_CONFIG.ZOffset))
     log("DEV CONTROLS | F5=lower+respawn Dave 10u | F6=respawn current test Z | F7=remove Dave")
+    log("DAVE RECOVERY | fresh-object reacquire active | firearm damage + zombie death fallback")
     return true
 end
 
