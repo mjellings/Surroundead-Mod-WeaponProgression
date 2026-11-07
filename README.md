@@ -4,9 +4,9 @@ A UE4SS Lua mod for **SurrounDead** that gives individual weapons their own pers
 
 Instead of every weapon of the same type being identical, WeaponProgression tracks each physical weapon separately. Use a weapon in combat, earn XP with it, level it up, and receive permanent stat improvements that stay associated with that specific weapon.
 
-**Version:** v0.18.4-rc2 · **Game:** SurrounDead · **Framework:** UE4SS
+**Version:** v0.18.5 · **Game:** SurrounDead · **Framework:** UE4SS
 
-This build addresses a reported crash after firearm level-ups by moving delayed Unreal object work onto the game thread. It has passed static checks but needs in-game verification before replacing the public download. Dave's gunsmith and English, Russian and French UI text remain included; existing `data.db` v2 files stay compatible.
+v0.18.5 adds **melee weapon progression** (with its own `melee.db`, F8 panel and tooltips), stops level-up rewards being wasted on capped stats, makes `data.db` recover from its backup instead of losing progress, and fixes kills being credited to the wrong gun. Dave's developer keys are now off by default. Existing `data.db` v2 files stay compatible.
 
 ---
 
@@ -86,7 +86,20 @@ Press **F8** while holding a tracked firearm to open the native status card. It 
 
 Find **Dave** at the Safe Zone and press **F** to open his gunsmith screen. He can reroll a tracked firearm at **Level 5 or above** if it has ordinary progression upgrades. Rerolling redistributes those ordinary upgrades while preserving the weapon's identity, level, XP, kills and mastery bonuses. Rerolls are free in this version.
 
-Dave uses a native QuestGiver interaction prompt. His screen closes when you walk away. His location is currently fixed by `Scripts/gunsmith/locations.lua`; random spawns and a reroll cost are future work. The development controls F5 (lower and respawn), F6 (respawn) and F7 (remove Dave) are still enabled in this build. The standalone `NPCRerollResearch` mod is no longer needed.
+Dave uses a native QuestGiver interaction prompt. His screen closes when you walk away. His location is currently fixed by `Scripts/gunsmith/locations.lua`; random spawns and a reroll cost are future work. The development controls F5 (lower and respawn), F6 (respawn) and F7 (remove Dave) are off by default; set `DevControls=true` under `[Utility]` in `config.ini` to enable them. The standalone `NPCRerollResearch` mod is no longer needed.
+
+### Melee Weapon Progression (experimental)
+
+Melee weapons level up from **melee kills** with their own XP curve, stats and ranks. Melee progress is saved in `melee.db`, separately from firearms in `data.db`.
+
+Each melee level-up rolls one of:
+
+- **Melee Damage** +2% (the whole roll range moves, not just the lower end)
+- **Stamina Cost** -3% per swing (never below `MinStaminaDrain`)
+- **Critical Chance** +1
+- **Critical Multiplier** +2
+
+Melee ranks (Scrapper, Brawler, Bruiser, Executioner) add fixed bonuses, including **attack speed**: a faster swing and a shorter delay between swings. Attack speed only comes from ranks, because it is not an item stat. Everything is configured in the `[Melee]`, `[MeleeStatUpgrades]`, `[MeleeCaps]` and `[MeleeMilestones]` sections of `config.ini`, and `[Melee] Enabled=false` turns it off. F8 shows a melee weapon's level, rank and stats (Melee Dmg, Crit Mult, Crit Chance, Stamina, Attack Speed), and hovering it in the inventory shows its upgraded stats like a firearm. Dave's rerolls are firearm-only for now.
 
 ### Rolled Weapon Stats Are Preserved
 
@@ -271,7 +284,7 @@ For ordinary Lua/mod development, UE4SS's **Reload All Mods** functionality can 
 
 Known limitations include:
 
-- **Melee weapons are not supported.**
+- Melee progression is new, so its balance may change. Dave does not reroll melee weapons yet.
 - Some runtime weapon discovery operations still need performance optimisation.
 - Compatibility across all SurrounDead weapons has not yet been exhaustively tested.
 - Extra custom progression rows in the inventory tooltip are disabled by default for compatibility.
@@ -284,7 +297,7 @@ Back up your progression data and saves before updating.
 
 ## What's next
 
-The next development work includes melee progression, broader weapon compatibility testing, more Dave spawn locations and reroll balancing, plus runtime performance improvements. See [CHANGELOG.md](CHANGELOG.md) for the complete development history.
+The next development work includes in-game melee balancing, broader weapon compatibility testing, more Dave spawn locations and reroll balancing, plus runtime performance improvements. See [CHANGELOG.md](CHANGELOG.md) for the complete development history.
 
 ---
 

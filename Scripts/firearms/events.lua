@@ -10,6 +10,58 @@ function M.New(ctx)
     local latestVanillaXP = nil
     local pendingDeath = nil
 
+    -- GetEquipmentUID fires for every equipment slot the game or UI asks
+    -- about, not only the gun being fired. Remember the last few UIDs seen so
+    -- a damage event can be matched to the UID whose saved record is the same
+    -- weapon model as the firearm that dealt the damage.
+    local RECENT_LIMIT = 8
+    local recentUIDs = {}   -- uid -> { uid=, struct=, seq= }
+    local uidSeq = 0
+    local lastMismatchKey = nil -- log each mismatch once, not on every shot
+
+    local function remember_uid(uid, struct)
+        uidSeq = uidSeq + 1
+        recentUIDs[uid] = { uid = uid, struct = struct, seq = uidSeq }
+        local count, oldest = 0, nil
+        for _, e in pairs(recentUIDs) do
+            count = count + 1
+            if oldest == nil or e.seq < oldest.seq then oldest = e end
+        end
+        if count > RECENT_LIMIT and oldest ~= nil then recentUIDs[oldest.uid] = nil end
+    end
+
+    local function record_weapon(uid)
+        local r = ctx.get_record and ctx.get_record(uid) or nil
+        if r == nil or r.weapon == nil or r.weapon == "" or r.weapon == "Unknown" then return nil end
+        return r.weapon
+    end
+
+    -- Returns uid, uidStruct for the weapon that fired, or nil when the only
+    -- candidate UIDs all belong to other, already-tracked weapons.
+    local function resolve_firing_uid(weaponName)
+        if latestWeaponUID == nil then return nil, nil end
+        if weaponName == nil or weaponName == "" then return latestWeaponUID, latestWeaponUIDStruct end
+
+        local latestName = record_weapon(latestWeaponUID)
+        if latestName == weaponName then return latestWeaponUID, latestWeaponUIDStruct end
+
+        local best = nil
+        for uid, e in pairs(recentUIDs) do
+            if record_weapon(uid) == weaponName and (best == nil or e.seq > best.seq) then best = e end
+        end
+        if best ~= nil then
+            ctx.log(string.format("KILL CREDIT | %s | latest uid %s is %s; using recent matching uid %s",
+                tostring(weaponName), tostring(latestWeaponUID), tostring(latestName), tostring(best.uid)))
+            return best.uid, best.struct
+        end
+
+        -- No tracked UID for this model. An untracked latest UID is assumed to
+        -- be this (new) weapon, which is how first use has always worked.
+        if latestName == nil then return latestWeaponUID, latestWeaponUIDStruct end
+
+        return nil, nil
+    end
+
     local function award_kill(uid, weaponName, vanillaXP)
         if uid == nil or vanillaXP == nil or vanillaXP <= 0 then return end
         local r = ctx.ensure_record(uid, weaponName)
@@ -66,6 +118,7 @@ function M.New(ctx)
         if uid then
             latestWeaponUID = uid
             latestWeaponUIDStruct = uidStruct
+            remember_uid(uid, uidStruct)
         end
     end
 
@@ -84,18 +137,27 @@ function M.New(ctx)
         local weaponName = ctx.short_name(Context)
         local target = ctx.unwrap(DamagedActor)
 
-        ctx.log(string.format("DAMAGE | %s -> %s | uid=%s", weaponName, ctx.short_name(target), latestWeaponUID or "<none>"))
+        local uid, uidStruct = resolve_firing_uid(weaponName)
 
-        if latestWeaponUID ~= nil and latestWeaponUIDStruct ~= nil then
-            ctx.probe_active_firearm_slot(latestWeaponUIDStruct, latestWeaponUID, weaponName)
+        ctx.log(string.format("DAMAGE | %s -> %s | uid=%s", weaponName, ctx.short_name(target), uid or "<none>"))
+
+        local mismatchKey = (uid == nil and latestWeaponUID ~= nil) and (tostring(weaponName) .. "|" .. tostring(latestWeaponUID)) or nil
+        if mismatchKey ~= nil and mismatchKey ~= lastMismatchKey then
+            ctx.log(string.format("KILL CREDIT MISMATCH | %s fired but latest uid %s is %s and no recent uid matches; damage not credited",
+                tostring(weaponName), tostring(latestWeaponUID), tostring(record_weapon(latestWeaponUID))))
+        end
+        lastMismatchKey = mismatchKey
+
+        if uid ~= nil and uidStruct ~= nil then
+            ctx.probe_active_firearm_slot(uidStruct, uid, weaponName)
         end
 
-        if pendingDeath ~= nil and latestWeaponUID ~= nil and ctx.same_object(target, pendingDeath.enemy) then
+        if pendingDeath ~= nil and ctx.same_object(target, pendingDeath.enemy) then
             local vanillaXP = pendingDeath.xp
             -- Consume before progression work to guard against duplicate callbacks.
             pendingDeath = nil
             latestVanillaXP = nil
-            award_kill(latestWeaponUID, weaponName, vanillaXP)
+            if uid ~= nil then award_kill(uid, weaponName, vanillaXP) end
         end
     end
 

@@ -26,8 +26,14 @@ function M.New(ctx)
         if def.key == "critmult" then return tr("critical_multiplier") .. " +" .. clean(Config.CriticalMultiplierPoints) end
         if def.key == "critchance" then return tr("critical_chance") .. " +" .. clean(Config.CriticalChancePoints) end
         if def.key == "rpm" then return tr("rpm") .. " +" .. clean(Config.RPMPercent) .. "%" end
+        if def.key == "__text" then return tostring(def.text) end
         if def.key == "falloff" then return tr("damage_falloff") .. " +" .. clean(Config.FalloffPercent) .. "%" end
         return tostring(def.tag)
+    end
+
+    -- Level-up toast with a ready-made reward text (used by melee progression).
+    function M.ShowReward(weaponName,newLevel,rewardText)
+        return M.Show(weaponName,newLevel,{ key="__text", tag=rewardText, text=rewardText })
     end
 
     function M.Show(weaponName,newLevel,def)

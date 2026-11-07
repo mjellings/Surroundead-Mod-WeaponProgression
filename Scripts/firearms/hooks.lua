@@ -1,4 +1,4 @@
--- WeaponProgression firearm hook manifest.
+-- WeaponProgression hook manifest (firearms, UI bridge and melee).
 -- Keeps hook ownership separate from bootstrap/lifecycle registration.
 local M = {}
 
@@ -14,6 +14,8 @@ function M.Build(paths, callbacks)
         {"ADD_XP",            paths.ADD_XP, callbacks.on_add_xp},
         {"ZOMBIE_DEATH",      paths.DEATH, callbacks.on_death},
         {"SERVER_DAMAGE",     paths.SERVER_DAMAGE, callbacks.on_server_damage},
+        {"MELEE_HIT_HEAD",    paths.MELEE_HIT_HEAD, callbacks.on_melee_hit},
+        {"MELEE_HIT_BODY",    paths.MELEE_HIT_BODY, callbacks.on_melee_hit},
     }
 end
 

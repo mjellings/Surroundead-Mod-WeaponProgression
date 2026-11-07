@@ -63,6 +63,7 @@ function H.exists(path) local f = io.open(path, "rb"); if f then f:close(); retu
 local FIELDS = {
     stat_name = "STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10",
     min_value = "MinValue_6_4B4822A7420F784740B6A58155973EE6",
+    max_value = "MaxValue_8_04A5809A498E900862BCCA9A6E412BD7",
     item_unique_id = "ItemUniqueID",
 }
 
@@ -72,12 +73,15 @@ H.TAGS = {
     critchance = "Jig.Stat.CriticalHitChance",
     rpm = "Jig.Stat.FirearmRPM",
     falloff = "Jig.Stat.DamageFallOff",
+    meleedamage = "Jig.Stat.MeleeDamage",
+    staminadrain = "Jig.Stat.StaminaDrain",
 }
 
 local SLOT_TAGS = {
     CPrimary = "Jig.PlayerSlot.PrimaryWeapon",
     CSecondary = "Jig.PlayerSlot.SecondaryWeapon",
     CSidearm = "Jig.PlayerSlot.SidearmWeapon",
+    CMelee = "Jig.PlayerSlot.MeleeWeapon",
 }
 
 -- --------------------------------------------------------------------------
@@ -138,6 +142,8 @@ Game.__index = Game
 --            or a string with the full config.ini text
 --   seed     RNG seed
 --   keep_db  true to keep an existing sandbox data.db (used by restart)
+--   real_gunsmith  load the real gunsmith/gunsmith.lua instead of the stub
+--                  (for checking its keybinds; Dave never spawns in tests)
 function H.new_game(opts)
     opts = opts or {}
     local self = setmetatable({}, Game)
@@ -145,13 +151,14 @@ function H.new_game(opts)
     self.dir = H.SANDBOX_ROOT .. "/" .. self.name
     self.seed = opts.seed or 12345
     self.config = opts.config
+    self.real_gunsmith = opts.real_gunsmith
     self.logs, self.toasts, self.hooks, self.keybinds = {}, {}, {}, {}
     self.timers, self.now = {}, 0
     self.weapons, self.slots = {}, {}
     self.writes = {}
     H.mkdir(H.SANDBOX_ROOT); H.mkdir(self.dir)
     if not opts.keep_db then
-        for _, f in ipairs({ "data.db", "data.db.bak", "data.db.tmp" }) do os.remove(self.dir .. "/" .. f) end
+        for _, f in ipairs({ "data.db", "data.db.bak", "data.db.tmp", "melee.db", "melee.db.bak", "melee.db.tmp" }) do os.remove(self.dir .. "/" .. f) end
     end
     self:write_config()
     return self
@@ -218,29 +225,55 @@ function Game:make_env()
     env.loadfile = function(path, mode, e)
         path = tostring(path):gsub("\\", "/")
         local rel = path:match("/Scripts/(.+)$")
-        if rel == "gunsmith/gunsmith.lua" then
+        if rel == "gunsmith/gunsmith.lua" and not game.real_gunsmith then
             return function()
                 return { Init = function(callbacks) game.gunsmith = callbacks; return true end }
             end
         end
         local real = rel and (H.SCRIPTS_DIR .. "/" .. rel) or path
+        if rel == "ui/status.lua" then
+            -- Keep the F8 state provider main.lua registers so tests can read it.
+            local chunk, err = loadfile(real, mode or "t", e or env)
+            if not chunk then return chunk, err end
+            return function(...)
+                local ui = chunk(...)
+                if type(ui) == "table" and type(ui.SetProvider) == "function" then
+                    local set = ui.SetProvider
+                    ui.SetProvider = function(p) game.ui_provider = p; return set(p) end
+                end
+                return ui
+            end
+        end
         return loadfile(real, mode or "t", e or env)
     end
     env.dofile = function(path) return assert(env.loadfile(path))() end
-    env.require = function(name) error("require disabled in tests: " .. tostring(name)) end
+    -- UE4SS's shared UEHelpers library (used by gunsmith.lua); everything
+    -- else the mod require()s is a fallback path that should not be needed.
+    local fakeHelpers = {
+        GetPlayer = function() return env.FindFirstOf("BP_PlayerCharacter_C") end,
+        GetWorld = function() return nil end,
+    }
+    env.require = function(name)
+        if name == "UEHelpers" then return fakeHelpers end
+        error("require disabled in tests: " .. tostring(name))
+    end
 
     -- Timers / threads
     env.ExecuteWithDelay = function(ms, fn)
-        game.timers[#game.timers + 1] = { at = game.now + (tonumber(ms) or 0), fn = fn }
+        game.timerSeq = (game.timerSeq or 0) + 1
+        game.timers[#game.timers + 1] = { at = game.now + (tonumber(ms) or 0), seq = game.timerSeq, fn = fn }
     end
     env.ExecuteInGameThread = function(fn) fn() end
     env.ExecuteAsync = function(fn) fn() end
     env.LoopAsync = function() end
 
     -- Hooks / keys
+    -- Several callbacks can hook the same UFunction (main.lua and Dave's
+    -- recovery hooks both watch damage/death), so keep them all.
     env.RegisterHook = function(path, cb)
-        game.hooks[path] = cb
-        return 1, 2
+        game.hooks[path] = game.hooks[path] or {}
+        table.insert(game.hooks[path], cb)
+        return #game.hooks[path], 2
     end
     env.RegisterKeyBind = function(key, a, b)
         game.keybinds[key] = type(a) == "function" and a or b
@@ -270,6 +303,13 @@ function Game:make_env()
         ["/Script/Engine.Default__KismetTextLibrary"] = textLib,
         ["/Script/Engine.Default__KismetMathLibrary"] = mathLib,
         ["/Game/Blueprints/GameFunctionLibrary.Default__GameFunctionLibrary_C"] = gameLib,
+        -- Classes the compatibility guard checks before hooking the hover tooltip.
+        ["/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C"] = uobject("Class OnHoverTooltipWidget_C"),
+        ["/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update"] = uobject("Function Update"),
+        ["/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C"] = uobject("Class BP_StatW_C"),
+        ["/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C:Construct"] = uobject("Function Construct"),
+        ["/Game/JigSInventory/Jigsaw/Widgets/BP_StatTextW.BP_StatTextW_C"] = uobject("Class BP_StatTextW_C"),
+        ["/Script/UMG.Default__WidgetBlueprintLibrary"] = uobject("WidgetBlueprintLibrary"),
     }
     env.StaticFindObject = function(path) return statics[path] end
 
@@ -313,7 +353,8 @@ end
 function Game:restart()
     local g = H.new_game({ name = self.name, config = self.config, seed = self.seed + 1, keep_db = true })
     for _, w in ipairs(self.weapons) do
-        g:add_weapon({ uid = w.uid, name = w.name, container = w.container, stats = w.original })
+        g:add_weapon({ uid = w.uid, name = w.name, container = w.container, stats = w.original, melee = w.melee,
+            swing_speed = w.speed_defaults and w.speed_defaults.SwingSpeed, swing_delay = w.speed_defaults and w.speed_defaults.DelayBetweenSwings })
     end
     return g:boot()
 end
@@ -321,7 +362,7 @@ end
 function Game:run_timers(budgetMs)
     local limit = self.now + (budgetMs or 60000)
     for _ = 1, 100000 do
-        table.sort(self.timers, function(a, b) return a.at < b.at end)
+        table.sort(self.timers, function(a, b) if a.at ~= b.at then return a.at < b.at end; return a.seq < b.seq end)
         local t = self.timers[1]
         if t == nil or t.at > limit then break end
         table.remove(self.timers, 1)
@@ -339,11 +380,15 @@ local HOOK_PATHS = {
     GET_ACTIVE_WEAPON = "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeapon",
     GET_ACTIVE_SLOT = "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeaponSlot",
     GET_EQUIPPED_REF = "/Game/JigSInventory/Jigsaw/Widgets/JSIContainer.JSIContainer_C:GetEquippedItemRef",
+    MELEE_HIT_HEAD = "/Game/Inventory/Items/Pickups/Weapons/Melee/BP_MeleePickup.BP_MeleePickup_C:HitHead",
+    MELEE_HIT_BODY = "/Game/Inventory/Items/Pickups/Weapons/Melee/BP_MeleePickup.BP_MeleePickup_C:HitBody",
+    TOOLTIP_UPDATE = "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update",
+    STAT_W_CONSTRUCT = "/Game/JigSInventory/Jigsaw/Widgets/BP_StatW.BP_StatW_C:Construct",
 }
 function Game:hook_path(key) return assert(HOOK_PATHS[key], key) end
 function Game:fire(key, ...)
-    local cb = assert(self.hooks[self:hook_path(key)], "hook not registered: " .. key)
-    cb(...)
+    local cbs = assert(self.hooks[self:hook_path(key)], "hook not registered: " .. key)
+    for _, cb in ipairs(cbs) do cb(...) end
 end
 
 -- --------------------------------------------------------------------------
@@ -363,11 +408,18 @@ function Game:add_weapon(opts)
     w.original = {}
     for k, v in pairs(opts.stats or {}) do w.original[k] = v end
     w.guid = { __guid = w.uid }
+    w.melee = opts.melee == true
+    -- A stat is a number (MinValue = MaxValue) or { min, max } for a roll range.
     local statArr = {}
-    for _, key in ipairs({ "damage", "critmult", "critchance", "rpm", "falloff" }) do
+    local order = w.melee and { "meleedamage", "staminadrain", "critchance", "critmult" }
+        or { "damage", "critmult", "critchance", "rpm", "falloff" }
+    for _, key in ipairs(order) do
         local v = w.original[key]
         if v ~= nil then
-            statArr[#statArr + 1] = { [FIELDS.stat_name] = gameplay_tag(H.TAGS[key]), [FIELDS.min_value] = v, __key = key }
+            local lo, hi = v, v
+            if type(v) == "table" then lo, hi = v[1], v[2] end
+            statArr[#statArr + 1] = { [FIELDS.stat_name] = gameplay_tag(H.TAGS[key]), [FIELDS.min_value] = lo,
+                [FIELDS.max_value] = hi, __key = key }
         end
     end
     local index = #self.slots
@@ -375,6 +427,10 @@ function Game:add_weapon(opts)
         string.format("JSI_Slot_C /Game/UI/WBP_Inventory.WBP_Inventory_C_0.WidgetTree.%s.WidgetTree_%d.JSI_Slot_C_%d", w.container, index, index),
         { [FIELDS.item_unique_id] = w.guid, ItemStats = statArr })
     w.pickup = uobject(string.format("BP_%sPickup_C /Game/Maps/World.BP_%sPickup_C_%d", w.name, w.name, index))
+    if w.melee then
+        w.speed_defaults = { SwingSpeed = (opts.swing_speed or 1.0), DelayBetweenSwings = (opts.swing_delay or 0.6) }
+        w.pickup.BP_WeaponsPickupComponent = { SwingSpeed = w.speed_defaults.SwingSpeed, DelayBetweenSwings = w.speed_defaults.DelayBetweenSwings }
+    end
     self.slots[#self.slots + 1] = w.slot
     self.weapons[#self.weapons + 1] = w
     return w
@@ -385,7 +441,9 @@ function Game:on_update_stat(slotUid, tagStruct, value)
         if w.guid == slotUid then
             for _, entry in ipairs(w.slot.ItemStats) do
                 if entry[FIELDS.stat_name] == tagStruct then
+                    -- Like the game: one value written to both ends of the range.
                     entry[FIELDS.min_value] = value
+                    entry[FIELDS.max_value] = value
                     self.writes[#self.writes + 1] = { weapon = w, key = entry.__key, value = value }
                     return
                 end
@@ -402,6 +460,24 @@ function Weapon:stat(key)
         if entry.__key == key then return entry[FIELDS.min_value] end
     end
     return nil
+end
+
+-- Upper end of a stat's roll range.
+function Weapon:stat_max(key)
+    for _, entry in ipairs(self.slot.ItemStats) do
+        if entry.__key == key then return entry[FIELDS.max_value] end
+    end
+    return nil
+end
+
+-- Melee pickup's attack speed component values.
+function Weapon:swing() return self.pickup.BP_WeaponsPickupComponent end
+
+-- Melee: one landed swing on an actor (HitBody; HitHead when head=true).
+function Weapon:swing_hit(target, head)
+    local g = self.game
+    g:fire(head and "MELEE_HIT_HEAD" or "MELEE_HIT_BODY", self.pickup, param(target or uobject("BP_Zombie_C /Game/Maps/World.BP_Zombie_C_dummy")), param(nil), param(1.0))
+    g:run_timers(5000)
 end
 
 -- Make this the weapon in the player's hands (fires the UI/equip hooks).
@@ -437,6 +513,43 @@ function Weapon:kill(xp)
     return self
 end
 
+-- Kill a zombie with this melee weapon: AddXP, Death, then the killing hit.
+function Weapon:melee_kill(xp, head)
+    local g = self.game
+    g.zombies = (g.zombies or 0) + 1
+    local zombie = uobject("BP_Zombie_C /Game/Maps/World.BP_Zombie_C_m" .. g.zombies)
+    g:fire("ADD_XP", uobject("LevellingComponent_C"), param(xp or 50), param(false), param(nil))
+    g:fire("DEATH", zombie, param(nil), param(false))
+    self:swing_hit(zombie, head)
+    return self
+end
+
+-- What the F8 panel would show right now (the state table main.lua hands the UI).
+function Game:f8_state()
+    assert(self.ui_provider, "F8 provider never registered; see game.logs")
+    return self.ui_provider()
+end
+
+-- Hover this weapon in the inventory: the tooltip Update fires, then one
+-- BP_StatW row is built per item stat. Returns { [stat key] = row text }
+-- for the rows the mod rewrote (untouched rows are absent).
+function Weapon:hover()
+    local g = self.game
+    local tooltip = uobject("OnHoverTooltipWidget_C /Game/UI/OnHoverTooltipWidget_C_0")
+    g:fire("TOOLTIP_UPDATE", param(tooltip), param(self.slot))
+    local rows = {}
+    for _, entry in ipairs(self.slot.ItemStats) do
+        local block = uobject("TextBlock /Game/UI/BP_StatW_C.TextBlock")
+        function block:SetText(t) self.text = t and t.__text end
+        local widget = uobject("BP_StatW_C /Game/UI/BP_StatW_C_" .. entry.__key,
+            { StatName = entry[FIELDS.stat_name], TextBlock = block })
+        g:fire("STAT_W_CONSTRUCT", param(widget))
+        rows[entry.__key] = block.text
+    end
+    g:run_timers(1000)
+    return rows
+end
+
 function Weapon:kills(n, xp) for _ = 1, n do self:kill(xp) end; return self end
 
 -- --------------------------------------------------------------------------
@@ -451,7 +564,26 @@ function Game:db_records()
 end
 
 function Weapon:record()
+    if self.melee then return self.game:melee_records()[self.uid] end
     return self.game:db_records()[self.uid]
+end
+
+local function KEY_BY_TAG_ANY(tag) for k, t in pairs(H.TAGS) do if t == tag then return k end end end
+
+function Game:melee_records()
+    local P = dofile(H.SCRIPTS_DIR .. "/core/persistence.lua")
+    local schema = dofile(H.SCRIPTS_DIR .. "/melee/melee_progression.lua").DB_SCHEMA
+    return P.NewStore(schema).Load({ self.dir .. "/melee.db" }, function() end)
+end
+
+-- Ordinary melee rewards in award order: { {level=, key=}, ... }
+function Game:melee_awarded()
+    local out = {}
+    for _, l in ipairs(self.logs) do
+        local lvl, tag = l:match("^MELEE UPGRADE AWARDED | [^|]+ | [^|]+ | L(%d+) | ([^ |]+)")
+        if lvl then out[#out + 1] = { level = tonumber(lvl), tag = tag, key = KEY_BY_TAG_ANY(tag) } end
+    end
+    return out
 end
 
 function Game:log_count(pattern)

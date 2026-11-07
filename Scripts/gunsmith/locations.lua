@@ -5,7 +5,8 @@
 --
 -- TestLocation:
 --   Set this to the location number where Dave should spawn.
---   Reload the WeaponProgression Lua scripts, then press F6 to respawn Dave.
+--   Reload the WeaponProgression Lua scripts, then press F6 to respawn Dave
+--   (needs [Utility] DevControls=true in config.ini).
 --
 -- ZOffset:
 --   Dave's BP_QuestGiver actor origin is ~80 Unreal units above his feet.

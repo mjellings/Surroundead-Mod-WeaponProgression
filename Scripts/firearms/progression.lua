@@ -1,5 +1,13 @@
--- WeaponProgression firearm progression policy.
+-- WeaponProgression progression policy (firearms, and melee with its own
+-- Config/stat tables).
 -- Pure Lua calculations only: no UObject discovery, hooks, or live mutation.
+--
+-- Stat modes:
+--   percent  compounding +Config[def.config]% per upgrade, milestone % added from base
+--   points   flat +Config[def.config] per upgrade and per milestone point
+--   reduce   lower is better: compounding -Config[def.config]% per upgrade,
+--            milestone % subtracted from base, cap is the maximum reduction,
+--            optional floor Config[def.floor] (never pushes below the base itself)
 local M = {}
 
 function M.New(ctx)
@@ -9,7 +17,7 @@ function M.New(ctx)
     local MILESTONE_BONUS_TYPES = assert(ctx.MilestoneBonusTypes, "MilestoneBonusTypes required")
     local CAP_CONFIG_BY_STAT = assert(ctx.CapConfigByStat, "CapConfigByStat required")
     local tr = ctx.Translate or function(key) return key end
-    local stat_labels = {
+    local stat_labels = ctx.StatLabels or {
         damage="damage", critchance="critical_chance", critmult="critical_multiplier",
         rpm="rpm", falloff="damage_falloff",
     }
@@ -71,6 +79,7 @@ function M.New(ctx)
             or string.format("%.1f", value):gsub("0+$", ""):gsub("%.$", "")
         local label = tr(stat_labels[meta.stat_key] or "unknown_weapon")
         if meta.mode == "percent" then return label .. " +" .. rendered .. "%" end
+        if meta.mode == "reduce" then return label .. " -" .. rendered .. "%" end
         return label .. " +" .. rendered
     end
 
@@ -86,6 +95,15 @@ function M.New(ctx)
             local capKey = CAP_CONFIG_BY_STAT[def.key]
             local capPercent = capKey and tonumber(Config[capKey]) or nil
             if capPercent ~= nil then target = math.min(target, base * (1.0 + (capPercent / 100.0))) end
+        elseif def.mode == "reduce" then
+            local normalTarget = base * ((1.0 - (Config[def.config] / 100.0)) ^ upgradeCount)
+            target = normalTarget - (base * (milestoneBonus / 100.0))
+            local capKey = CAP_CONFIG_BY_STAT[def.key]
+            local capPercent = capKey and tonumber(Config[capKey]) or nil
+            if capPercent ~= nil then target = math.max(target, base * (1.0 - (capPercent / 100.0))) end
+            local floor = def.floor and tonumber(Config[def.floor]) or nil
+            if floor ~= nil then target = math.max(target, math.min(base, floor)) end
+            target = math.max(target, 0)
         else
             target = base + (Config[def.config] * upgradeCount) + milestoneBonus
             local capKey = CAP_CONFIG_BY_STAT[def.key]
@@ -95,8 +113,9 @@ function M.New(ctx)
         return target
     end
 
-    -- True when one more ordinary upgrade would not raise this stat's target,
-    -- i.e. the configured cap (including milestone bonuses) is already reached.
+    -- True when one more ordinary upgrade would not change this stat's target
+    -- (raise it, or lower it for a "reduce" stat), i.e. the configured cap
+    -- (including milestone bonuses) is already reached.
     -- Uncaptured stats count as capped because they cannot be upgraded.
     function P.IsCapped(def, r)
         if def == nil or r == nil then return true end
@@ -106,7 +125,7 @@ function M.New(ctx)
         local now = P.StatTarget(def, base, count, r)
         local nxt = P.StatTarget(def, base, count + 1, r)
         if now == nil or nxt == nil then return true end
-        return (nxt - now) <= math.max(0.000001, math.abs(now) * 0.000000001)
+        return math.abs(nxt - now) <= math.max(0.000001, math.abs(now) * 0.000000001)
     end
 
     -- Returns def, nil on success; nil, "no_bases" while no stat has been

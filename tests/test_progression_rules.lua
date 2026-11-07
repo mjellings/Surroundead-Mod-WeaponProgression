@@ -102,3 +102,32 @@ test("PreventConsecutiveSameStat gives way when only one stat has headroom", fun
     local r = { level = 3, bases = { critmult = 20, damage = 100 }, upgrades = { critmult = 10 }, last_upgrade = "damage" }
     eq(P.ChooseUpgradeDef(r).key, "damage")
 end)
+
+-- "reduce" stats (melee stamina cost): lower is better.
+local function reduce_rules(extra)
+    local P = H.progression(extra)
+    local def = { key = "stamina", mode = "reduce", config = "StaminaPct", floor = "MinStamina" }
+    return P, def
+end
+
+test("reduce stats shrink by a compounding percentage per upgrade", function()
+    local P, def = reduce_rules({ StaminaPct = 10 })
+    local r = { level = 1, bases = { stamina = 10 }, upgrades = {} }
+    near(P.StatTarget(def, 10, 1, r), 9)
+    near(P.StatTarget(def, 10, 2, r), 8.1)
+end)
+
+test("reduce stats respect the floor but never go up to meet it", function()
+    local P, def = reduce_rules({ StaminaPct = 50, MinStamina = 4 })
+    local r = { level = 1, bases = { stamina = 10 }, upgrades = {} }
+    near(P.StatTarget(def, 10, 3, r), 4, "floored at 4")
+    near(P.StatTarget(def, 3, 3, r), 3, "base already below floor stays put")
+end)
+
+test("IsCapped works for reduce stats once the floor is reached", function()
+    local P, def = reduce_rules({ StaminaPct = 50, MinStamina = 4 })
+    local r = { level = 1, bases = { stamina = 10 }, upgrades = { stamina = 1 } }
+    ok(not P.IsCapped(def, r), "5 -> 4 still possible")
+    r.upgrades.stamina = 2
+    ok(P.IsCapped(def, r), "at the floor")
+end)

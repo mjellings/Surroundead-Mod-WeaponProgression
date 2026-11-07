@@ -18,6 +18,8 @@ local files = {
     "test_rewards_and_caps.lua",
     "test_restart_and_save.lua",
     "test_gunsmith.lua",
+    "test_gunsmith_controls.lua",
+    "test_melee.lua",
     "test_persistence.lua",
 }
 

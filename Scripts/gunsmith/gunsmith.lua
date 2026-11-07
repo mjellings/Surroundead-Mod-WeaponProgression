@@ -861,8 +861,8 @@ local function register_recovery_hooks()
     return false
 end
 
-local function register_controls()
-    -- Development controls:
+local function register_dev_controls()
+    -- Development controls, only when config.ini [Utility] DevControls=true:
     --   F5 = destroy Dave, lower spawn Z by 10 units, then respawn him
     --   F6 = destroy current Dave and spawn a fresh one at the configured test point
     --   F7 = destroy/unload Dave only
@@ -899,6 +899,12 @@ local function register_controls()
             end)
         end)
     end)
+end
+
+local function register_controls()
+    if api and api.DevControls == true then
+        register_dev_controls()
+    end
 
     -- F closes Dave's panel after the opening keypress debounce.
     pcall(function()
@@ -959,7 +965,11 @@ function M.Init(callbacks)
         " | name=" .. tostring(selected.Name or "<unnamed>") ..
         " | rawZ=" .. tostring(selected.Z) ..
         " | ZOffset=" .. tostring(LOCATION_CONFIG.ZOffset))
-    log("DEV CONTROLS | F5=lower+respawn Dave 10u | F6=respawn current test Z | F7=remove Dave")
+    if api.DevControls == true then
+        log("DEV CONTROLS | ENABLED | F5=lower+respawn Dave 10u | F6=respawn current test Z | F7=remove Dave")
+    else
+        log("DEV CONTROLS | disabled (set [Utility] DevControls=true to enable F5/F6/F7)")
+    end
     log("DAVE RECOVERY | fresh-object reacquire active | firearm damage + zombie death fallback")
     return true
 end

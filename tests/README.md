@@ -15,7 +15,7 @@ Each test prints `PASS` or `FAIL` with the reason. The command exits with code 1
 
 - `lua tests/run_tests.lua caps` runs only the tests whose name contains "caps".
 - Set `WP_TEST_VERBOSE=1` to see the mod's own log lines while the tests run. In PowerShell that's `$env:WP_TEST_VERBOSE=1`.
-- Set `WP_MOD_ROOT` to a folder containing `Scripts/` and `config.ini` to test a different copy of the mod. For example, testing the RC2 folder shows the 12 tests that cover the bugs fixed in v0.18.5 failing.
+- Set `WP_MOD_ROOT` to a folder containing `Scripts/` and `config.ini` to test a different copy of the mod. For example, testing the RC2 folder shows the 16 tests that cover the bugs fixed in v0.18.5 failing.
 
 The tests never touch your real `data.db` or `config.ini`. Each simulated game session gets its own scratch folder under `tests/.sandbox/`. That folder can be deleted at any time and should not ship in the release zip (and neither should `tests/`).
 
@@ -24,10 +24,12 @@ The tests never touch your real `data.db` or `config.ini`. Each simulated game s
 | File | What it checks |
 | --- | --- |
 | `test_progression_rules.lua` | The XP curve, `[LevelThresholds]`, percent and point stat maths, milestones and their RPM to falloff fallback, caps, and which stat a level-up may pick |
-| `test_kills_and_levels.lua` | Base stat capture on first shot, kill XP and the multiplier, level-ups with overflow, several level-ups from one kill, kill attribution (wrong zombie, non-kill XP, duplicate events), MaxLevel, and weapons tracked separately |
+| `test_kills_and_levels.lua` | Base stat capture on first shot, kill XP and the multiplier, level-ups with overflow, several level-ups from one kill, kill attribution (wrong zombie, non-kill XP, duplicate events, the right gun credited when another slot was queried last), MaxLevel, and weapons tracked separately |
 | `test_rewards_and_caps.lua` | Live stat writes on level-up, toast text, no repeated stat, no RPM on weapons without it, milestone bonuses applied live, caps held all the way to level 100, no wasted upgrades, and pending rewards paid out |
 | `test_restart_and_save.lua` | Saving after every kill, saved upgrades re-applied after a restart (without re-capturing boosted stats as bases), and recovery from a crash-emptied `data.db` |
 | `test_gunsmith.lua` | Dave's reroll: level 5 minimum, held-weapon check, level, XP and kills kept, live stats following the new rolls, and over-capped legacy weapons trimmed |
+| `test_gunsmith_controls.lua` | Dave's F5/F6/F7 dev keys are off by default and on with `DevControls=true` (this one loads the real `gunsmith.lua`) |
+| `test_melee.lua` | Melee kills and XP, firearm kills not credited to melee, level-up stat writes and toasts, roll range kept on melee damage, stamina cost lowered with a floor, rank bonuses, attack speed and its cap, caps to max level, restart, and `[Melee] Enabled=false` |
 | `test_persistence.lua` | `data.db` round-trip, `.bak` rotation and fallback, refusing to save fewer records than were loaded, and a failed write leaving files intact |
 
 ## How the fake game works (`lib/fake_game.lua`)
@@ -39,6 +41,7 @@ The tests never touch your real `data.db` or `config.ini`. Each simulated game s
 - `weapon:equip()` fires the equip and active-weapon hooks, as switching to the weapon does.
 - `weapon:kill(xp)` fires `AddXP`, then the zombie's `Death`, then the killing shot's `SERVER_DamageEvent`, in the order the game does.
 - `weapon:hit()` damages without killing.
+- For melee, `game:add_weapon{ melee = true, container = "CMelee", stats = { meleedamage = { 34, 36 }, ... } }` (a `{ min, max }` pair is a roll range), then `weapon:melee_kill(xp)` and `weapon:swing_hit()`. `weapon:stat_max(key)` and `weapon:swing()` show the range's upper end and the attack speed values.
 - `weapon:stat("damage")` gives the live value after any `UpdateStatByUID` writes.
 - `weapon:record()` reads the weapon's row back from the sandbox `data.db`.
 - `game.toasts`, `game.logs`, `game:awarded()` and `game:has_log("...")` show what the player would have seen.
@@ -46,6 +49,6 @@ The tests never touch your real `data.db` or `config.ini`. Each simulated game s
 - `game:seed_db{...}` writes a `data.db` before boot, for legacy or edge-case records.
 - `game.gunsmith.Reroll(uid)` and `game.gunsmith.GetSnapshot()` are the same functions `main.lua` hands to Dave's UI.
 
-Dave's spawning and UI (`gunsmith/gunsmith.lua`), the F8 panel and the tooltip widgets need the real game. They are stubbed out here and still need in-game checks. Stat randomness is seeded, so a run is repeatable.
+Dave's spawning and UI, the F8 panel and the tooltip widgets need the real game. They still need in-game checks. `gunsmith.lua` is replaced by a stub unless a test passes `real_gunsmith = true`. Stat randomness is seeded, so a run is repeatable.
 
 To add a test, put a `test("what it checks", function() ... end)` in one of the files (or a new file listed in `run_tests.lua`), using `eq`, `near` and `ok` for assertions.

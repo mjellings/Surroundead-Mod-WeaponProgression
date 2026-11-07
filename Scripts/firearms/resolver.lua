@@ -102,6 +102,7 @@ function M.New(d)
     function api.ResolvePlayerJig(reason) return resolve_player_jig_direct(reason) end
     function api.RefreshLiveStatEntry(live,def,index) return refresh_live_stat_entry(live,def,index) end
     function api.GetLive(uid) return liveWeapons[uid] end
+    function api.ReadLiveStatMap(slot) return read_live_stat_map(slot) end
     function api.Invalidate(uid,weaponName,detail) if liveWeapons[uid]~=nil then liveWeapons[uid]=nil; cacheCounters.lifecycle_resets=cacheCounters.lifecycle_resets+1; cache_log("RESET",uid,weaponName,detail or "cache invalidated") end end
     function api.SetCallbacks(pending,reconcile) pendingCb=pending; reconcileCb=reconcile end
     return api

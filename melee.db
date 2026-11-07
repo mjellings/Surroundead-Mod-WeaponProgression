@@ -1,0 +1,3 @@
+# WeaponProgression melee.db v1
+# uid\tlevel\txp\tkills\tweapon\tlast_upgrade\tbase_meleedamage\tup_meleedamage\tbase_staminadrain\tup_staminadrain\tbase_critchance\tup_critchance\tbase_critmult\tup_critmult\tpending_rewards\tbase_swingspeed\tbase_swingdelay\tmax_meleedamage\tmax_staminadrain\tmax_critchance\tmax_critmult
+E356752D-4E6F-C6E3-0B1D-1583929231F9	5	6.54517784118656	6	FiremansAxe	critchance	35	0	3	1	19	2	19	1	0	0.9	0.95	35	3	19	19

@@ -366,7 +366,7 @@ local function build()
             config.next_size, config.muted_text_colour, 16, y, 122, 20)
         local value = make_text_block(content, suffix, "StatValue" .. tostring(i), "--",
             config.next_size, config.text_colour, 140, y, 190, 20)
-        stat_rows[spec.key] = { label=label, value=value }
+        stat_rows[spec.key] = { label=label, value=value, default_label=spec.label, shown_label=spec.label }
     end
 
     local lower_divider = make_border(
@@ -516,11 +516,20 @@ local function render(state)
         set_progress(xp)
     end
 
+    -- A stat names the row it fills with stat.row (melee reuses the firearm
+    -- rows), and state.row_labels renames rows; both default to the firearm layout.
     local statByKey = {}
     for _, stat in ipairs(state.stats or {}) do
-        if stat.key ~= nil then statByKey[tostring(stat.key)] = stat end
+        local rowKey = stat.row or stat.key
+        if rowKey ~= nil then statByKey[tostring(rowKey)] = stat end
     end
+    local rowLabels = state.row_labels or {}
     for key, row in pairs(runtime.refs.stat_rows or {}) do
+        local wantLabel = rowLabels[key] or row.default_label
+        if wantLabel ~= nil and wantLabel ~= row.shown_label then
+            set_textblock(row.label, wantLabel)
+            row.shown_label = wantLabel
+        end
         local stat = statByKey[key]
         if stat ~= nil and stat.base ~= nil and stat.current ~= nil then
             local text = tostring(stat.base) .. "  →  " .. tostring(stat.current)

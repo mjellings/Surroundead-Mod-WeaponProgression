@@ -3,7 +3,7 @@
 -- Configuration and installation: see README.md.
 
 local PREFIX = "[WeaponProgression] "
-local VERSION = "0.18.5-dev1"
+local VERSION = "0.18.5"
 
 local PATH_GET_EQUIPMENT_UID =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetEquipmentUID"
@@ -21,6 +21,10 @@ local PATH_GET_ACTIVE_WEAPON =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeapon"
 local PATH_GET_ACTIVE_WEAPON_SLOT =
     "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:GetActiveWeaponSlot"
+local PATH_MELEE_HIT_HEAD =
+    "/Game/Inventory/Items/Pickups/Weapons/Melee/BP_MeleePickup.BP_MeleePickup_C:HitHead"
+local PATH_MELEE_HIT_BODY =
+    "/Game/Inventory/Items/Pickups/Weapons/Melee/BP_MeleePickup.BP_MeleePickup_C:HitBody"
 local PATH_GET_EQUIPPED_ITEM_REF =
     "/Game/JigSInventory/Jigsaw/Widgets/JSIContainer.JSIContainer_C:GetEquippedItemRef"
 
@@ -46,7 +50,26 @@ local function get_mod_directory()
     return scriptsDir:match("^(.*)/Scripts$") or scriptsDir
 end
 
-local MOD_DIR = get_mod_directory()
+-- debug.getinfo normally gives main.lua's full path. If a UE4SS build ever
+-- reports only a bare chunk name, fall back to the usual install locations
+-- (relative to the game's Win64 folder) instead of failing on a nil path.
+local MOD_DIR_WARNING = nil
+local function resolve_mod_directory()
+    local dir = get_mod_directory()
+    if dir ~= nil then return dir end
+    for _, candidate in ipairs({ "Mods/WeaponProgression", "ue4ss/Mods/WeaponProgression", "./Mods/WeaponProgression" }) do
+        local f = io.open(candidate .. "/Scripts/main.lua", "r")
+        if f then
+            f:close()
+            MOD_DIR_WARNING = "MOD DIR | script path unavailable; using " .. candidate
+            return candidate
+        end
+    end
+    MOD_DIR_WARNING = "MOD DIR ERROR | could not locate the WeaponProgression folder; modules will fail to load"
+    return "Mods/WeaponProgression"
+end
+
+local MOD_DIR = resolve_mod_directory()
 
 local function candidate_paths(fileName)
     local paths = {}
@@ -91,6 +114,7 @@ local DEFAULT_CONFIG = {
     PreventConsecutiveSameStat = true,
     VerboseLogging = false,
     ShowProgressionTooltipRows = false,
+    DevControls = false,
     Language = "en",
 
     MilestonesEnabled = true,
@@ -128,6 +152,7 @@ local Config = {
     PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat,
     VerboseLogging = DEFAULT_CONFIG.VerboseLogging,
     ShowProgressionTooltipRows = DEFAULT_CONFIG.ShowProgressionTooltipRows,
+    DevControls = DEFAULT_CONFIG.DevControls,
     Language = DEFAULT_CONFIG.Language,
 
     MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled,
@@ -180,11 +205,13 @@ local reconcile_weapon_stats = nil
 local process_pending_rewards = nil
 local stat_target = nil
 local progression_bonus_label = nil
+local MeleeProgression = nil -- set by load_melee_progression()
 local cachedJigComponent = nil
 
 local QUIET_LOG_PREFIXES = {
     -- Routine per-hit/cache chatter. Failures and mismatches intentionally remain visible.
     "DAMAGE |",
+    "KILL CREDIT |",
     "FIREARM LIVE STAT |",
     "LIVE CACHE ",
     "JSI SCAN |",
@@ -217,6 +244,8 @@ local function log(msg)
     end
     print(PREFIX .. text .. "\n")
 end
+
+if MOD_DIR_WARNING ~= nil then log(MOD_DIR_WARNING) end
 
 local translate, translate_rank = nil, nil
 do
@@ -255,12 +284,14 @@ end
 local Compatibility = nil
 
 local FirearmProgression = nil
+local ProgressionModule = nil
 do
     local path = MOD_DIR .. "/Scripts/firearms/progression.lua"
     local okLoad, chunkOrErr = pcall(loadfile, path)
     if okLoad and chunkOrErr ~= nil then
         local okRun, moduleOrErr = pcall(chunkOrErr)
         if okRun and type(moduleOrErr) == "table" then
+            ProgressionModule = moduleOrErr
             local okNew, instanceOrErr = pcall(moduleOrErr.New, {
                 Config = Config,
                 StatDefs = STAT_DEFS,
@@ -583,6 +614,7 @@ local function reset_config()
     Config.PreventConsecutiveSameStat = DEFAULT_CONFIG.PreventConsecutiveSameStat
     Config.VerboseLogging = DEFAULT_CONFIG.VerboseLogging
     Config.ShowProgressionTooltipRows = DEFAULT_CONFIG.ShowProgressionTooltipRows
+    Config.DevControls = DEFAULT_CONFIG.DevControls
     Config.Language = DEFAULT_CONFIG.Language
 
     Config.MilestonesEnabled = DEFAULT_CONFIG.MilestonesEnabled
@@ -807,13 +839,15 @@ local function load_config()
                         set_stat_upgrade_value(key, value)
 
                     elseif section == "Utility" and
-                           (key == "VerboseLogging" or key == "ShowProgressionTooltipRows") then
+                           (key == "VerboseLogging" or key == "ShowProgressionTooltipRows" or key == "DevControls") then
                         local b = parse_bool(value)
                         if b == nil then
                             log("CONFIG WARNING | ignored invalid boolean " ..
                                 tostring(key) .. "=" .. tostring(value))
                         elseif key == "VerboseLogging" then
                             Config.VerboseLogging = b
+                        elseif key == "DevControls" then
+                            Config.DevControls = b
                         else
                             Config.ShowProgressionTooltipRows = b
                         end
@@ -1129,6 +1163,98 @@ local function ui_refresh_if_open()
     end
 end
 
+-- Whole numbers stay whole; small stats such as a 7.76 stamina cost keep one
+-- decimal so a 3% change is still visible.
+local function display_stat_value(v)
+    local n = tonumber(v)
+    if n == nil then return nil end
+    local rounded = math.floor(n + (n >= 0 and 0.5 or -0.5))
+    if math.abs(n - rounded) < 0.05 then return tostring(rounded) end
+    return string.format("%.1f", n)
+end
+
+-- F8 rows are shared with firearms. Melee stats borrow them in this order:
+-- damage, crit mult, crit chance, then stamina cost in the RPM row and attack
+-- speed in the falloff row.
+local MELEE_UI_ROWS = { meleedamage = "damage", critmult = "critmult", critchance = "critchance", staminadrain = "rpm" }
+
+local function melee_row_labels()
+    return {
+        damage = tr("melee_dmg_short"), critmult = tr("crit_mult"), critchance = tr("crit_chance"),
+        rpm = tr("stamina_short"), falloff = tr("attack_speed"),
+    }
+end
+
+local function melee_progression_state()
+    local weaponName = tostring(uiActive.weapon)
+    if MeleeProgression == nil or MeleeProgression.Config.Enabled ~= true then
+        return { weapon = weaponName, status = tr("no_firearm_progression") }
+    end
+    if uiActive.uid == nil then
+        return { weapon = weaponName, status = tr("resolving_weapon") }
+    end
+
+    local labels = melee_row_labels()
+    local r = MeleeProgression.Records()[uiActive.uid]
+    if r == nil then
+        return { weapon = weaponName, level = 1, xp_percent = 0, row_labels = labels, stats = {} }
+    end
+
+    local MP = MeleeProgression.Progression
+    local MC = MeleeProgression.Config
+    local level = math.max(1, math.floor(tonumber(r.level) or 1))
+    local xpPercent = 100
+    if level < MC.MaxLevel then
+        local needed = MP.XPRequired(level)
+        xpPercent = (needed and needed > 0) and math.max(0, math.min(100, ((tonumber(r.xp) or 0) / needed) * 100)) or 0
+    end
+
+    local uiStats = {}
+    r.bases = r.bases or {}
+    r.upgrades = r.upgrades or {}
+    for _, def in ipairs(MeleeProgression.STAT_DEFS or {}) do
+        local base = tonumber(r.bases[def.key])
+        if base ~= nil then
+            local target = MP.StatTarget(def, base, math.floor(tonumber(r.upgrades[def.key]) or 0), r)
+            if target ~= nil then
+                uiStats[#uiStats + 1] = {
+                    key = def.key, row = MELEE_UI_ROWS[def.key],
+                    base = display_stat_value(base), current = display_stat_value(target),
+                    bonus = progression_bonus_label(def, base, target),
+                }
+            end
+        end
+    end
+    local speed = MeleeProgression.AttackSpeedPercent(level) or 0
+    uiStats[#uiStats + 1] = {
+        key = "attackspeed", row = "falloff", base = "100%",
+        current = display_stat_value(100 + speed) .. "%",
+        bonus = speed > 0 and ("+" .. display_stat_value(speed) .. "%") or nil,
+    }
+
+    local currentRank, nextRank = MP.GetRankInfo(level)
+    local nextBonus = nil
+    if nextRank ~= nil then
+        if nextRank.bonus_type == "AttackSpeedPercent" then
+            nextBonus = tr("attack_speed") .. " +" .. tostring(display_stat_value(nextRank.value)) .. "%"
+        else
+            nextBonus = MP.MilestoneDescription(nextRank, r)
+        end
+    end
+
+    return {
+        weapon = tostring(r.weapon or weaponName),
+        level = level,
+        xp_percent = xpPercent,
+        rank = currentRank and display_rank(currentRank.rank) or nil,
+        next_rank = nextRank and display_rank(nextRank.rank) or nil,
+        next_level = nextRank and tonumber(nextRank.level) or nil,
+        next_bonus = nextBonus,
+        stats = uiStats,
+        row_labels = labels,
+    }
+end
+
 local function ui_progression_state()
     if uiActive.weapon == nil or uiActive.weapon == "" then
         return { weapon = tr("no_active_weapon"), status = tr("no_progression_data") }
@@ -1136,7 +1262,7 @@ local function ui_progression_state()
 
     if uiActive.container == "CMelee" or
        uiActive.slot_tag == "Jig.PlayerSlot.MeleeWeapon" then
-        return { weapon = tostring(uiActive.weapon), status = tr("no_firearm_progression") }
+        return melee_progression_state()
     end
 
     if uiActive.uid == nil then
@@ -1886,6 +2012,7 @@ do
                 short_name = short_name,
                 same_object = same_object,
                 ensure_record = ensure_record,
+                get_record = function(uid) return records[uid] end,
                 xp_required = xp_required,
                 milestone_bonus_description = milestone_bonus_description,
                 award_stat_upgrade = award_stat_upgrade,
@@ -1984,7 +2111,7 @@ progression_bonus_label = function(def, base, target)
     base = tonumber(base)
     target = tonumber(target)
     if def == nil or base == nil or target == nil then return nil end
-    if def.mode == "percent" then
+    if def.mode == "percent" or def.mode == "reduce" then
         if math.abs(base) < 0.000001 then return nil end
         local pct = ((target / base) - 1.0) * 100.0
         if math.abs(pct) < 0.000001 then return nil end
@@ -2026,7 +2153,8 @@ local function unit_suffix(unit)
     return " " .. unit
 end
 
-local function add_progression_rows(tooltip, r, weaponName)
+-- prog: optional { XPRequired, GetRankInfo } for melee records; firearms by default.
+local function add_progression_rows(tooltip, r, weaponName, prog)
     local t = unwrap(tooltip)
     if t == nil or r == nil then return false end
 
@@ -2073,13 +2201,15 @@ local function add_progression_rows(tooltip, r, weaponName)
         return false
     end
 
-    local needed = xp_required(r.level or 1)
+    local needed = prog and prog.XPRequired(r.level or 1) or xp_required(r.level or 1)
     local xp = tonumber(r.xp) or 0
     local xpPercent = 0
     if needed ~= nil and needed > 0 then
         xpPercent = math.max(0, math.min(100, (xp / needed) * 100))
     end
-    local currentRank, nextRank = get_rank_info(r.level or 1)
+    local currentRank, nextRank
+    if prog then currentRank, nextRank = prog.GetRankInfo(r.level or 1)
+    else currentRank, nextRank = get_rank_info(r.level or 1) end
     local nextText = tr("max")
     if nextRank ~= nil then
         nextText = tostring(display_rank(nextRank.rank)) .. " @ L" .. tostring(nextRank.level)
@@ -2146,6 +2276,36 @@ local function add_progression_rows(tooltip, r, weaponName)
     end
 
     return true
+end
+
+-- Tooltip context for a melee weapon tracked in melee.db (nil when untracked).
+local function melee_tooltip_context(uid, itemName)
+    if MeleeProgression == nil or MeleeProgression.Config.Enabled ~= true then return nil end
+    local r = MeleeProgression.Records()[uid]
+    if r == nil then return nil end
+    local MP = MeleeProgression.Progression
+    local weaponName = (r.weapon ~= nil and tostring(r.weapon) ~= "") and tostring(r.weapon) or tostring(itemName)
+    local ctx = { uid = uid, weapon = weaponName, record = r, by_tag = {}, prog = MP, melee = true }
+    r.bases = r.bases or {}
+    r.upgrades = r.upgrades or {}
+    local tracked = 0
+    for _, def in ipairs(MeleeProgression.STAT_DEFS or {}) do
+        local base = tonumber(r.bases[def.key])
+        if base ~= nil then
+            local count = math.floor(tonumber(r.upgrades[def.key]) or 0)
+            local target = MP.StatTarget(def, base, count, r)
+            if target ~= nil then
+                local bonusLabel = progression_bonus_label(def, base, target)
+                if bonusLabel ~= nil then tracked = tracked + 1 end
+                ctx.by_tag[def.tag] = { base = base, target = target, bonus_label = bonusLabel }
+                log(string.format("TOOLTIP STAT | %s | %s | base=%.3f | target=%.3f | upgrades=%d | melee",
+                    weaponName, def.tag, base, target, count))
+            end
+        end
+    end
+    log(string.format("TOOLTIP DIAG | MELEE RECORD FOUND | item=%s | uid=%s | L%d | kills=%d | tracked_stats=%d",
+        weaponName, uid, math.floor(r.level or 1), math.floor(r.kills or 0), tracked))
+    return ctx
 end
 
 local function on_tooltip_update(Context, ItemRefParam, ...)
@@ -2256,10 +2416,15 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
         log("TOOLTIP DIAG | CONTEXT BUILT | weapon=" .. tostring(itemName) ..
             " | tracked_stats=" .. tostring(#parts))
     else
-        log(string.format(
-            "TOOLTIP DIAG | RECORD NOT FOUND | item=%s | uid=%s | ItemStats=%s",
-            tostring(itemName), uid, tostring(statsCount or "?")
-        ))
+        tooltipBonusContext = melee_tooltip_context(uid, itemName)
+        if tooltipBonusContext ~= nil then
+            itemName = tooltipBonusContext.weapon
+        else
+            log(string.format(
+                "TOOLTIP DIAG | RECORD NOT FOUND | item=%s | uid=%s | ItemStats=%s",
+                tostring(itemName), uid, tostring(statsCount or "?")
+            ))
+        end
     end
 
     local tooltipContext = unwrap(Context)
@@ -2274,7 +2439,7 @@ local function on_tooltip_update(Context, ItemRefParam, ...)
                 if ctx ~= nil and ctx.record ~= nil then
                     if Config.ShowProgressionTooltipRows then
                         log("TOOLTIP DIAG | BEFORE PROGRESSION ROWS | weapon=" .. tostring(ctx.weapon))
-                        add_progression_rows(tooltipContext, ctx.record, ctx.weapon)
+                        add_progression_rows(tooltipContext, ctx.record, ctx.weapon, ctx.prog)
                         log("TOOLTIP DIAG | AFTER PROGRESSION ROWS | weapon=" .. tostring(ctx.weapon))
                     else
                         log("TOOLTIP DIAG | PROGRESSION ROWS SKIPPED | weapon=" .. tostring(ctx.weapon) ..
@@ -2304,6 +2469,8 @@ local TOOLTIP_UNIT_BY_TAG = {
     ["Jig.Stat.CriticalHitChance"] = "%",
     ["Jig.Stat.FirearmRPM"] = "",
     ["Jig.Stat.DamageFallOff"] = " M",
+    ["Jig.Stat.MeleeDamage"] = "",
+    ["Jig.Stat.StaminaDrain"] = "",
 }
 
 local function on_stat_w_construct(Context, ...)
@@ -2357,7 +2524,8 @@ local function on_stat_w_construct(Context, ...)
         return
     end
 
-    local rendered = display_integer(effective) .. (TOOLTIP_UNIT_BY_TAG[tagName] or "")
+    local shown = ctx.melee and display_stat_value(effective) or display_integer(effective)
+    local rendered = shown .. (TOOLTIP_UNIT_BY_TAG[tagName] or "")
     local suffix = statInfo.bonus_label
     if suffix ~= nil then
         rendered = rendered .. " (" .. tostring(suffix) .. ")"
@@ -2406,6 +2574,38 @@ local function on_inventory_add_cache_invalidate(Context, LocalCompParam, ItemId
     end
 end
 
+-- ============================================================================
+-- Melee progression (Scripts/melee/melee_progression.lua), own melee.db
+-- ============================================================================
+local function load_melee_progression()
+    local path = MOD_DIR .. "/Scripts/melee/melee_progression.lua"
+    local okLoad, chunkOrErr = pcall(loadfile, path)
+    if not okLoad or chunkOrErr == nil then log("MELEE LOAD FAILED | " .. tostring(chunkOrErr)); return end
+    local okRun, moduleOrErr = pcall(chunkOrErr)
+    if not okRun or type(moduleOrErr) ~= "table" then log("MELEE LOAD FAILED | " .. tostring(moduleOrErr)); return end
+    if ProgressionModule == nil or Persistence == nil or FirearmResolver == nil then
+        log("MELEE LOAD FAILED | progression, persistence or resolver module unavailable"); return
+    end
+    local okNew, instanceOrErr = pcall(moduleOrErr.New, {
+        log = log, Translate = tr, unwrap = unwrap, short_name = short_name, same_object = same_object,
+        guid_to_string = guid_to_string, Fields = FIELDS,
+        read_live_stat_map = FirearmResolver.ReadLiveStatMap,
+        resolve_player_jig = FirearmResolver.ResolvePlayerJig,
+        get_equipped_melee = function() return uiEquipped.CMelee end,
+        get_active_container = function() return uiActive.container end,
+        ProgressionModule = ProgressionModule, Persistence = Persistence,
+        config_path = configPath,
+        show_toast = function(weaponName, level, text)
+            if FirearmNotifications then return FirearmNotifications.ShowReward(weaponName, level, text) end
+        end,
+        defer = function(fn) ExecuteWithDelay(1, function() ExecuteInGameThread(fn) end) end,
+    })
+    if not okNew then log("MELEE INIT FAILED | " .. tostring(instanceOrErr)); return end
+    instanceOrErr.Load(candidate_paths("melee.db"))
+    MeleeProgression = instanceOrErr
+    log("MELEE PROGRESSION | active=" .. tostring(MeleeProgression.Config.Enabled))
+end
+
 local hooks = nil
 do
     local path = MOD_DIR .. "/Scripts/firearms/hooks.lua"
@@ -2424,6 +2624,8 @@ do
                 ADD_XP = PATH_ADD_XP,
                 DEATH = PATH_DEATH,
                 SERVER_DAMAGE = PATH_SERVER_DAMAGE,
+                MELEE_HIT_HEAD = PATH_MELEE_HIT_HEAD,
+                MELEE_HIT_BODY = PATH_MELEE_HIT_BODY,
             }, {
                 on_get_equipment_uid = FirearmEvents and FirearmEvents.OnGetEquipmentUID or nil,
                 ui_on_get_active_weapon = ui_on_get_active_weapon,
@@ -2432,9 +2634,18 @@ do
                 on_inventory_add_cache_invalidate = on_inventory_add_cache_invalidate,
                 on_tooltip_update = on_tooltip_update,
                 on_stat_w_construct = on_stat_w_construct,
-                on_add_xp = FirearmEvents and FirearmEvents.OnAddXP or nil,
-                on_death = FirearmEvents and FirearmEvents.OnDeath or nil,
+                on_add_xp = function(...)
+                    if FirearmEvents then FirearmEvents.OnAddXP(...) end
+                    if MeleeProgression then MeleeProgression.OnAddXP(...) end
+                end,
+                on_death = function(...)
+                    if FirearmEvents then FirearmEvents.OnDeath(...) end
+                    if MeleeProgression then MeleeProgression.OnDeath(...) end
+                end,
                 on_server_damage = FirearmEvents and FirearmEvents.OnServerDamage or nil,
+                on_melee_hit = function(...)
+                    if MeleeProgression then MeleeProgression.OnHit(...); ui_refresh_if_open() end
+                end,
             })
         else
             log("FIREARM HOOK MANIFEST LOAD FAILED | " .. tostring(moduleOrErr))
@@ -2506,6 +2717,7 @@ local function load_integrated_gunsmith()
             GetSnapshot = gunsmith_snapshot,
             Reroll = gunsmith_reroll,
             Translate = tr,
+            DevControls = Config.DevControls == true,
             Log = function(msg)
                 log("GUNSMITH | " .. tostring(msg))
             end,
@@ -2532,12 +2744,13 @@ log("NATIVE TOOLTIP REQUESTED | rounded effective stats, inline progression bonu
 log("COMPATIBILITY GUARD ACTIVE | tooltip hooks are attempted only after their expected Blueprint classes/UFunctions are present; game version is logged diagnostically.")
 log("REUSABLE NATIVE UI ACTIVE | mastery rank + next milestone | XP bar | 3s auto-close reset by weapon switch.")
 log("MASTERY MILESTONES ACTIVE | config.ini-driven fixed bonuses + cumulative caps | deterministic reconstruction from weapon level.")
-log("INTEGRATED GUNSMITH ACTIVE | Dave spawns at the Safe Zone test location; F6 respawns, F7 removes; rerolls use direct in-memory progression state.")
+log("INTEGRATED GUNSMITH ACTIVE | Dave spawns at the Safe Zone test location; rerolls use direct in-memory progression state. F5/F6/F7 dev keys follow [Utility] DevControls.")
 log("----------------------------------------------------------------")
 
 math.randomseed(os.time())
 load_config()
 load_db()
+load_melee_progression()
 load_integrated_gunsmith()
 
 if UI ~= nil then

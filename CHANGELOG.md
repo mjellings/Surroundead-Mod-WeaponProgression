@@ -2,15 +2,48 @@
 
 Major changes to WeaponProgression are listed below. Earlier development checkpoints are retained for troubleshooting and research.
 
-## v0.18.5-dev1 — Capped-stat rewards and database safety
+## v0.18.5 — Melee progression, capped-stat fix and database safety
+
+Release summary (details in the development entries below):
+
+- **Melee progression.** Melee weapons now level up from kills with their own XP curve, ranks and stat rolls (Melee Damage, Stamina Cost, Critical Chance, Critical Multiplier), plus attack speed from ranks. Progress is saved in a separate `melee.db` and configured in the new `[Melee]`, `[MeleeStatUpgrades]`, `[MeleeCaps]` and `[MeleeMilestones]` sections of `config.ini`. F8 and the inventory hover tooltip show melee stats like firearms.
+- **No more wasted upgrades.** Level-up rewards and Dave's rerolls skip stats that are already at their cap.
+- **Safer `data.db`.** An emptied or truncated `data.db` is recovered from `data.db.bak`, and a save that would lose weapons is refused.
+- **Correct kill credit.** Kills go to the gun that fired, not to whichever slot the game queried last.
+- **Dave's F5/F6/F7 developer keys are off by default** (`[Utility] DevControls=true` turns them on).
+- The mod no longer fails to load when UE4SS does not report its folder.
+- `data.db` v2 format and existing config keys are unchanged. Update by replacing the mod folder; keep your `data.db` (and `melee.db` if you have one).
+
+## v0.18.5-dev4 — Melee in F8 and tooltips
+
+- F8 now shows melee weapons: level, XP, rank, next rank and its bonus, and the stat rows Melee Dmg, Crit Mult, Crit Chance, Stamina and Attack Speed (base → current, with the bonus). Previously it said "no firearm progression". Firearm rows keep their own labels.
+- Hovering a tracked melee weapon in the inventory now shows its upgraded stats with the bonus, like firearms (for example `7.5 (-6%)` for Stamina Cost). Small values keep one decimal so a stamina reduction is visible.
+- Stamina Cost bonuses show as a percentage (`-6%`) instead of points.
+- The F8 panel refreshes after a melee hit while it is open.
+- 7 new offline tests (75 total); the test harness can now read the F8 state and simulate an inventory hover.
+
+## v0.18.5-dev3 — Melee progression
+
+- Added melee weapon progression (`Scripts/melee/melee_progression.lua`). Melee kills are detected from `BP_MeleePickup_C:HitHead`/`HitBody` after the zombie's `Death`, only while the melee slot is active. Melee weapons have their own XP curve, stat rolls (Melee Damage, Stamina Cost, Critical Chance, Critical Multiplier), caps and ranks, and are saved in a separate `melee.db`. Firearm progression and `data.db` are unchanged.
+- Melee damage upgrades keep the stat's roll range: after `UpdateStatByUID` (which writes one value to both ends), the upper end is restored to the upgraded value and read back.
+- Stamina Cost is a new lower-is-better stat mode (`reduce`) with a `MinStaminaDrain` floor.
+- Attack speed comes from `AttackSpeedPercent` melee ranks and is applied to the pickup's swing speed and swing delay from the captured defaults, so it never compounds.
+- New config sections: `[Melee]`, `[MeleeStatUpgrades]`, `[MeleeCaps]`, `[MeleeMilestones]`. New melee strings in English, Russian and French.
+- `core/persistence.lua` now builds independent stores from a column schema; `data.db` keeps the exact same format.
+- 16 new offline tests (68 total). Melee still needs in-game verification, especially the roll-range write and attack speed.
+
+## v0.18.5-dev2 — Capped-stat rewards, database safety, kill credit and dev keys
 
 - Level-up rewards no longer roll stats that are already at their `[Caps]` limit (including milestone bonuses). Previously the upgrade was counted, clamped to the cap, and still announced, so it was wasted.
 - When every captured stat on a weapon is capped, a level-up is logged as `STAT UPGRADE SKIPPED` and awards nothing. It is not banked as a pending reward. Levels, ranks and milestones are unchanged.
 - Dave's rerolls only place rolls on stats with room below their cap. Rolls that could not improve anything are dropped, so the first reroll on an over-capped weapon removes its wasted upgrades.
 - `data.db` loading falls back to `data.db.bak` when `data.db` is present but has no readable records (e.g. emptied or truncated by a crash), and logs `DATABASE RECOVERY`. Unreadable lines are counted in a `DATABASE WARNING`.
 - `data.db` saving now refuses to write fewer weapon records than were loaded (records are never deleted at runtime), and checks every write and the file close before replacing `data.db`. A failed write leaves `data.db` and `data.db.bak` untouched.
+- Kill credit: a kill is now credited to the UID whose saved record is the same weapon model as the firearm that fired, picked from the last few UIDs the game reported. Previously it went to whichever equipment slot was queried last, which could credit (and rename) another tracked gun. When no recent UID matches and the latest one belongs to a different tracked weapon, the kill is not credited and `KILL CREDIT MISMATCH` is logged once.
+- Dave's F5/F6/F7 developer keys are now off by default. Set `DevControls=true` under `[Utility]` in `config.ini` to enable them.
+- If UE4SS does not report `main.lua`'s path, the mod now falls back to the usual `Mods/WeaponProgression` locations and logs `MOD DIR` instead of failing to load.
 - Added an offline test suite (`tests/`, not shipped in the release zip). It runs the real `main.lua` against a fake UE4SS/SurrounDead layer and covers kills, XP, level-ups, rewards, milestones, caps, restarts, Dave's rerolls and `data.db` safety. Run it with `lua tests/run_tests.lua`; see `tests/README.md`.
-- No change to the `data.db` v2 format or config keys. All 48 offline tests pass; in-game verification is still required.
+- No change to the `data.db` v2 format or config keys. All 52 offline tests pass at dev2; in-game verification is still required.
 
 ## v0.18.4-rc2 — Game-thread crash hotfix candidate
 

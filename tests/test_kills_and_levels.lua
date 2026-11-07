@@ -101,3 +101,49 @@ test("each weapon tracks its own progression", function()
     eq(rifle:record().level, 2); eq(rifle:record().kills, 1)
     eq(pistol:record().level, 1); near(pistol:record().xp, 30)
 end)
+
+-- Kill credit: GetEquipmentUID also fires for slots the UI asks about, so the
+-- latest UID is not always the gun that fired.
+local function query_slot(g, w)
+    g:fire("GET_EQUIPMENT_UID", H.uobject("BP_JigHelperComp_C"), H.param(nil), H.param(w.guid))
+end
+
+local function kill_with_pickup_only(g, w, xp)
+    -- Death + damage from w's pickup, without w's own GetEquipmentUID first.
+    g.zombies = (g.zombies or 0) + 1
+    local zombie = H.uobject("BP_Zombie_C /Game/Maps/World.BP_Zombie_C_x" .. g.zombies)
+    g:fire("ADD_XP", H.uobject("LevellingComponent_C"), H.param(xp), H.param(false), H.param(nil))
+    g:fire("DEATH", zombie, H.param(nil), H.param(false))
+    g:fire("SERVER_DAMAGE", w.pickup, H.param(false), H.param(zombie), H.param(nil))
+    g:run_timers(5000)
+end
+
+test("a kill goes to the gun that fired even if another slot was queried last", function()
+    local g = H.new_game({ name = "kills" })
+    local rifle = g:add_weapon({ name = "HuntingRifle", stats = RIFLE })
+    local pistol = g:add_weapon({ name = "BlackOpsUSP", container = "CSidearm", stats = { damage = 26.52, critchance = 11 } })
+    g:boot()
+    rifle:equip():hit(); pistol:equip():hit() -- both tracked
+    rifle:equip()
+    query_slot(g, pistol) -- UI asks about the sidearm slot
+    kill_with_pickup_only(g, rifle, 40)
+    eq(rifle:record().kills, 1, "rifle credited")
+    eq(pistol:record().kills, 0, "pistol not credited")
+    eq(pistol:record().weapon, "BlackOpsUSP", "pistol record not renamed")
+end)
+
+test("a kill is not credited when no recent UID matches the gun that fired", function()
+    local g = H.new_game({ name = "kills" })
+    local rifle = g:add_weapon({ name = "HuntingRifle", stats = RIFLE })
+    local pistol = g:add_weapon({ name = "BlackOpsUSP", container = "CSidearm", stats = { damage = 26.52, critchance = 11 } })
+    g:seed_db({ { uid = rifle.uid, weapon = "HuntingRifle", level = 3, bases = { damage = 88.74 }, upgrades = { damage = 1 } } })
+    g:boot()
+    pistol:equip():hit()
+    -- Rifle fires but its UID was never reported this session.
+    kill_with_pickup_only(g, rifle, 40)
+    kill_with_pickup_only(g, rifle, 40)
+    eq(pistol:record().kills, 0, "pistol not credited")
+    eq(pistol:record().weapon, "BlackOpsUSP", "pistol record not renamed")
+    eq(rifle:record().kills, 0, "rifle unknown this session")
+    eq(g:log_count("KILL CREDIT MISMATCH"), 1, "mismatch logged once, not per shot")
+end)
