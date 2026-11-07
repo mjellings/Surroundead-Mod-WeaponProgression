@@ -1,0 +1,6 @@
+# WeaponProgression data.db v2
+# uid\tlevel\txp\tkills\tweapon\tlast_upgrade\tbase_damage\tup_damage\tbase_critmult\tup_critmult\tbase_critchance\tup_critchance\tbase_rpm\tup_rpm\tbase_falloff\tup_falloff\tpending_rewards
+0A0AA4EB-4044-8CB2-01C0-AD8FC6FF1F70	15	2.33172397017506	43	M2010	damage	155	4	23	4	24	1		0	184	5	0
+376E44F3-4097-97BF-8E42-FFA4EA3457A3	4	190.867549623549	3	BlackOpsUSP	critchance	26.52	1	23	0	11	1	365.16	0	26	1	0
+55D39D69-4374-0309-4F31-B89792109396	7	369.662549628317	17	HuntingRifle	critchance	88.74	1	22	1	13	3		0	93.84	1	0
+EBB06EB4-4BF6-B29F-1C9F-88B16FC42EDE	46	377.650630629063	388	Crusher	rpm	96.7572	7	27	10	19	6	1017.167868	14	85.833	8	0

@@ -41,6 +41,13 @@ local runtime = {
     provider=nil, state=nil, rendered={}, serial=0,
 }
 
+local translate = function(key) return ({
+    weapon_progression="WEAPON PROGRESSION", level="LEVEL", xp="XP", weapon_stats="WEAPON STATS",
+    damage="Damage", crit_mult="Crit Mult", crit_chance="Crit Chance", rpm="RPM", falloff="Falloff",
+    next="NEXT", no_active_weapon="No active weapon", unranked="UNRANKED", max_rank="MAX RANK",
+})[key] or key end
+local function tr(key) return translate(key) end
+
 local function log(message)
     print(PREFIX .. tostring(message) .. "\n")
 end
@@ -278,19 +285,19 @@ local function build()
     end
 
     local title = make_text_block(
-        content, suffix, "Title", config.title,
+        content, suffix, "Title", tr("weapon_progression"),
         config.title_size, config.muted_text_colour,
         16, 10, 310, 22
     )
 
     local weapon = make_text_block(
-        content, suffix, "Weapon", "No active weapon",
+        content, suffix, "Weapon", tr("no_active_weapon"),
         config.weapon_size, config.text_colour,
         16, 31, 318, 32
     )
 
     local rank = make_text_block(
-        content, suffix, "Rank", "UNRANKED",
+        content, suffix, "Rank", tr("unranked"),
         config.rank_size, config.muted_text_colour,
         16, 61, 318, 20
     )
@@ -301,7 +308,7 @@ local function build()
     )
 
     local level_label = make_text_block(
-        content, suffix, "LevelLabel", "LEVEL",
+        content, suffix, "LevelLabel", tr("level"),
         config.label_size, config.muted_text_colour,
         16, 96, 90, 23
     )
@@ -313,7 +320,7 @@ local function build()
     )
 
     local xp_label = make_text_block(
-        content, suffix, "XPLabel", "XP",
+        content, suffix, "XPLabel", tr("xp"),
         config.label_size, config.muted_text_colour,
         16, 123, 90, 23
     )
@@ -340,25 +347,25 @@ local function build()
     end
 
     local stats_header = make_text_block(
-        content, suffix, "StatsHeader", "WEAPON STATS",
+        content, suffix, "StatsHeader", tr("weapon_stats"),
         config.next_size, config.muted_text_colour,
         16, 176, 150, 19
     )
 
     local stat_specs = {
-        { key="damage",     label="Damage" },
-        { key="critmult",   label="Crit Mult" },
-        { key="critchance", label="Crit Chance" },
-        { key="rpm",        label="RPM" },
-        { key="falloff",    label="Falloff" },
+        { key="damage",     label=tr("damage") },
+        { key="critmult",   label=tr("crit_mult") },
+        { key="critchance", label=tr("crit_chance") },
+        { key="rpm",        label=tr("rpm") },
+        { key="falloff",    label=tr("falloff") },
     }
     local stat_rows = {}
     for i, spec in ipairs(stat_specs) do
         local y = 197 + ((i - 1) * 22)
         local label = make_text_block(content, suffix, "StatLabel" .. tostring(i), spec.label,
-            config.next_size, config.muted_text_colour, 16, y, 88, 20)
+            config.next_size, config.muted_text_colour, 16, y, 122, 20)
         local value = make_text_block(content, suffix, "StatValue" .. tostring(i), "--",
-            config.next_size, config.text_colour, 106, y, 224, 20)
+            config.next_size, config.text_colour, 140, y, 190, 20)
         stat_rows[spec.key] = { label=label, value=value }
     end
 
@@ -368,21 +375,21 @@ local function build()
     )
 
     local next_label = make_text_block(
-        content, suffix, "NextLabel", "NEXT",
+        content, suffix, "NextLabel", tr("next"),
         config.next_size, config.muted_text_colour,
-        16, 320, 48, 20
+        16, 320, 65, 20
     )
 
     local next_value = make_text_block(
         content, suffix, "NextValue", "Proven I · L5",
         config.next_size, config.text_colour,
-        69, 320, 265, 20
+        85, 320, 249, 20
     )
 
     local next_bonus = make_text_block(
         content, suffix, "NextBonus", "",
         config.next_size, config.muted_text_colour,
-        69, 339, 265, 19
+        85, 339, 249, 19
     )
 
     local status = make_text_block(
@@ -413,9 +420,9 @@ local function build()
     runtime.refs.next_bonus=next_bonus; runtime.refs.status=status
 
     runtime.rendered={
-        title=tostring(config.title or ""),
-        weapon="No active weapon",
-        rank="UNRANKED",
+        title=tr("weapon_progression"),
+        weapon=tr("no_active_weapon"),
+        rank=tr("unranked"),
         level_value="--",
         xp_value="--",
         next_value="Proven I · L5",
@@ -463,7 +470,7 @@ local function render(state)
     if runtime.root == nil or not is_valid(runtime.root) then return false end
     state = state or {}
 
-    set_text("weapon", state.weapon or "No active weapon")
+    set_text("weapon", state.weapon or tr("no_active_weapon"))
 
     if state.status ~= nil and tostring(state.status) ~= "" then
         set_stat_mode(false)
@@ -477,16 +484,18 @@ local function render(state)
 
     local rank = state.rank
     if rank == nil or tostring(rank) == "" then
-        set_text("rank", "UNRANKED")
+        set_text("rank", tr("unranked"))
     else
-        set_text("rank", string.upper(tostring(rank)))
+        -- Lua's byte-oriented string.upper cannot uppercase Cyrillic or accented letters.
+        local label = tostring(rank)
+        set_text("rank", label:find("[\128-\255]") and label or string.upper(label))
     end
 
     if state.next_rank ~= nil and state.next_level ~= nil then
         set_text("next_value", tostring(state.next_rank) .. " · L" .. tostring(math.floor(tonumber(state.next_level) or 0)))
         set_text("next_bonus", tostring(state.next_bonus or ""))
     else
-        set_text("next_value", "MAX RANK")
+        set_text("next_value", tr("max_rank"))
         set_text("next_bonus", "")
     end
 
@@ -531,6 +540,7 @@ end
 
 function UI.Configure(options)
     if type(options) ~= "table" then return end
+    if type(options.Translate) == "function" then translate = options.Translate end
     for key, value in pairs(options) do
         if config[key] ~= nil then config[key]=value end
     end

@@ -62,12 +62,20 @@ local runtime = {
 }
 
 local STAT_ROWS = {
-    {key="damage",     label="Damage"},
-    {key="critmult",   label="Critical Hit Multiplier"},
-    {key="critchance", label="Critical Hit Chance"},
-    {key="rpm",        label="RPM"},
-    {key="falloff",    label="Damage Falloff"},
+    {key="damage",     label="damage"},
+    {key="critmult",   label="critical_multiplier"},
+    {key="critchance", label="critical_chance"},
+    {key="rpm",        label="rpm"},
+    {key="falloff",    label="damage_falloff"},
 }
+
+local translate = function(key) return ({
+    dave_title="DAVE'S GUNSMITH", no_active_weapon="No active weapon", level="LEVEL",
+    damage="Damage", critical_multiplier="Critical Hit Multiplier", critical_chance="Critical Hit Chance",
+    rpm="RPM", damage_falloff="Damage Falloff", free_reroll="FREE REROLL", reroll="REROLL",
+    reroll_explanation="Redistributes ordinary progression bonuses.\nLevel, XP, kills and mastery are preserved.",
+})[key] or key end
+local function tr(key) return translate(key) end
 
 local function log(message)
     print(PREFIX .. tostring(message) .. "\n")
@@ -330,17 +338,17 @@ local function build()
     end
 
     -- Header
-    local title = tx("Title", config.title,
+    local title = tx("Title", tr("dave_title"),
         config.title_size, config.muted_text_colour,
         20, 13, W - 40, 20)
 
-    local weapon = tx("Weapon", "No active weapon",
+    local weapon = tx("Weapon", tr("no_active_weapon"),
         config.weapon_size, config.text_colour,
         20, 34, W - 40, 32)
 
     divider("DividerHeader", 70)
 
-    local level = tx("Level", "LEVEL --",
+    local level = tx("Level", tr("level") .. " --",
         config.label_size, config.muted_text_colour,
         20, 82, 180, 22)
 
@@ -355,7 +363,7 @@ local function build()
     for _, row in ipairs(STAT_ROWS) do
         runtime.refs.stat_labels[row.key] = tx(
             "StatLabel_" .. row.key,
-            row.label,
+            tr(row.label),
             config.label_size,
             config.muted_text_colour,
             20, statY, 255, 22
@@ -375,12 +383,12 @@ local function build()
     divider("DividerService", 281)
 
     -- Service footer
-    local service = tx("Service", "FREE REROLL",
+    local service = tx("Service", tr("free_reroll"),
         config.title_size, config.muted_text_colour,
         20, 292, 180, 20)
 
     local message = tx("Message",
-        "Redistributes ordinary progression bonuses.\nLevel, XP, kills and mastery are preserved.",
+        tr("reroll_explanation"),
         config.message_size, config.text_colour,
         20, 318, W - 40, 54)
 
@@ -401,7 +409,7 @@ local function build()
         local buttonText = construct("/Script/UMG.TextBlock", button, "DG_RerollText_" .. suffix)
         if buttonText ~= nil then
             style_text(buttonText, config.button_size, config.text_colour)
-            set_text_raw(buttonText, "REROLL")
+            set_text_raw(buttonText, tr("reroll"))
             pcall(function() button:SetContent(buttonText) end)
             runtime.refs.button_text = buttonText
         end
@@ -449,11 +457,11 @@ local function render(state)
     state = state or {}
     runtime.state = state
 
-    set_widget_text(runtime.refs.weapon, state.weapon or "No active weapon")
+    set_widget_text(runtime.refs.weapon, state.weapon or tr("no_active_weapon"))
 
     if state.level ~= nil then
         set_widget_text(runtime.refs.level,
-            "LEVEL " .. tostring(math.floor(tonumber(state.level) or 1)))
+            tr("level") .. " " .. tostring(math.floor(tonumber(state.level) or 1)))
     else
         set_widget_text(runtime.refs.level, "")
     end
@@ -488,9 +496,9 @@ local function render(state)
     set_widget_text(runtime.refs.message,
         state.message
         or state.status
-        or "Redistributes ordinary progression bonuses.\nLevel, XP, kills and mastery are preserved.")
+        or tr("reroll_explanation"))
 
-    set_widget_text(runtime.refs.button_text, state.button_text or "REROLL")
+    set_widget_text(runtime.refs.button_text, state.button_text or tr("reroll"))
     set_button_enabled(state.button_enabled == true)
 
     local buttonOpacity = (state.show_button == false) and 0.0 or 1.0
@@ -506,6 +514,7 @@ end
 
 function UI.Configure(options)
     if type(options) ~= "table" then return end
+    if type(options.Translate) == "function" then translate = options.Translate end
     for k, v in pairs(options) do
         if config[k] ~= nil then config[k] = v end
     end

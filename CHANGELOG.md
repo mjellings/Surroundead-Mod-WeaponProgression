@@ -1,10 +1,103 @@
 # Changelog
 
-This file records the significant development milestones for WeaponProgression.
+Major changes to WeaponProgression are listed below. Earlier development checkpoints are retained for troubleshooting and research.
 
-The project is still in pre-release development, so older entries include research builds that established behaviour later retained by the current mod.
+## v0.18.5-dev1 — Capped-stat rewards and database safety
 
-## v0.18.x
+- Level-up rewards no longer roll stats that are already at their `[Caps]` limit (including milestone bonuses). Previously the upgrade was counted, clamped to the cap, and still announced, so it was wasted.
+- When every captured stat on a weapon is capped, a level-up is logged as `STAT UPGRADE SKIPPED` and awards nothing. It is not banked as a pending reward. Levels, ranks and milestones are unchanged.
+- Dave's rerolls only place rolls on stats with room below their cap. Rolls that could not improve anything are dropped, so the first reroll on an over-capped weapon removes its wasted upgrades.
+- `data.db` loading falls back to `data.db.bak` when `data.db` is present but has no readable records (e.g. emptied or truncated by a crash), and logs `DATABASE RECOVERY`. Unreadable lines are counted in a `DATABASE WARNING`.
+- `data.db` saving now refuses to write fewer weapon records than were loaded (records are never deleted at runtime), and checks every write and the file close before replacing `data.db`. A failed write leaves `data.db` and `data.db.bak` untouched.
+- Added an offline test suite (`tests/`, not shipped in the release zip). It runs the real `main.lua` against a fake UE4SS/SurrounDead layer and covers kills, XP, level-ups, rewards, milestones, caps, restarts, Dave's rerolls and `data.db` safety. Run it with `lua tests/run_tests.lua`; see `tests/README.md`.
+- No change to the `data.db` v2 format or config keys. All 48 offline tests pass; in-game verification is still required.
+
+## v0.18.4-rc2 — Game-thread crash hotfix candidate
+
+- Moved delayed stat verification onto the game thread after a report of an access violation on UE4SS's async thread shortly after firearm level-up. The reported address and timing suggest this path, but the crash dump has not yet been examined.
+- Moved delayed level-up notifications, tooltip updates, and core and Dave hook-registration retries onto the game thread when they access Unreal objects or UE4SS registration APIs.
+- No intended changes to firearm progression rules, Dave's rerolls, language selection, config defaults, or the `data.db` v2 format. In-game verification is still required.
+
+## v0.18.4-rc1 — Release candidate
+
+- Introduced Dave's native `[F]` gunsmith interaction at the configured Safe Zone spawn. Tracked Level 5+ firearms can reroll their ordinary stat upgrades for free while keeping weapon identity, level, XP, kills and mastery bonuses.
+- Preserved existing `data.db` v2 records and firearm progression while splitting the runtime into focused core, firearm, UI, compatibility and gunsmith modules.
+- Added selectable English, Russian and French mod UI text through `[Localization] Language`.
+- Delayed the first core Blueprint hook registration pass to avoid early-startup stack-trace noise; late-loading hooks continue to retry.
+- Kept the extra tooltip progression rows disabled by default because they can crash some UE4SS builds. F8 remains the full progression view.
+- Firearm progression and the quiet-startup build were tested in game. Dave's interaction and the Russian/French layouts were subsequently checked before publication.
+
+### Development checkpoints
+
+#### v0.18.4-dev11a5.2 — French and Russian localisation
+
+- Wired the existing `[Localization] Language` option into the runtime. English remains the default; `ru` and `fr` now select Russian and French strings, with unsupported values falling back to English.
+- Translated the F8 status card, Dave's gunsmith UI and reroll messages, level-up notifications, and milestone bonus descriptions. Built-in milestone names are translated for display; user-authored rank names and saved data stay unchanged.
+- Kept gameplay rules, firearm event attribution, stat mutation, persistence, hook registration, and Dave's spawning behaviour unchanged.
+- Test checkpoint based on the runtime-proven dev11a5.1 build. French and Russian display still require in-game verification, especially Cyrillic glyph rendering and text fit.
+
+#### v0.18.4-dev11a5.1 — Quiet startup hook registration
+
+- Based directly on dev11a5; no firearm event/progression behavior changes.
+- Defers the first core hook-registration pass by 6 seconds so Blueprint UFunctions can finish initialising before `RegisterHook` is called.
+- Prevents the normal early-startup `UFunction::Func: 0x0` registration window from flooding UE4SS with misleading Lua stack traces.
+- Existing retry lifecycle remains active for genuinely late-loading Blueprints.
+- Tested in game on the author's gaming PC: normal firearm progression and upgrades worked. Dave was not visited during this checkpoint.
+
+
+#### v0.18.4-dev11a5 — Firearm event boundary
+
+- Based directly on the runtime-proven dev11a4 baseline.
+- Added `Scripts/firearms/events.lua` for transient damage/death attribution state and kill-to-progression orchestration.
+- Kept hook lifecycle, resolver/stat mutation, UI/tooltip, Dave and persistence responsibilities in their existing modules.
+- No intended gameplay, balance, database, UI, Dave or reroll changes.
+- This checkpoint was superseded by the game-tested dev11a5.1 build.
+
+
+#### v0.18.4-dev11a4 — Resolver and live stat boundary
+
+- Extracted live firearm/JSI resolution and transient UObject cache ownership into `Scripts/firearms/resolver.lua`.
+- Extracted native stat mutation, delayed verification and reconciliation into `Scripts/firearms/stats.lua`.
+- Retains the proven richest-populated duplicate-slot selection policy.
+- Retains fresh live stat-entry reacquisition immediately before `UpdateStatByUID`.
+- No intended gameplay, balance, database, UI, Dave or reroll changes.
+- Test checkpoint based on runtime-proven dev11a3.
+
+
+#### v0.18.4-dev11a3 — Firearm responsibility split
+- Extracted pure firearm progression policy into `Scripts/firearms/progression.lua`.
+- Extracted native firearm level-up notifications into `Scripts/firearms/notifications.lua`.
+- Extracted the firearm/UI hook manifest into `Scripts/firearms/hooks.lua`.
+- Kept live Unreal resolver/stat mutation code in `main.lua` for a later isolated checkpoint.
+- No intended gameplay, balance, persistence, Dave, reroll, F8, tooltip, or DB-format changes.
+
+#### v0.18.4-dev11a2 — Persistence and hook lifecycle split
+
+- Continued the tested dev11a1 structural refactor.
+- Moved data.db v2 load/save/recovery into `Scripts/core/persistence.lua`.
+- Moved delayed Blueprint hook registration/retry/compatibility gating into `Scripts/core/hook_lifecycle.lua`.
+- No intentional firearm progression, balance, UI, Dave, reroll, or database-format changes.
+
+#### v0.18.4-dev11a1 — Dave recovery hook startup
+
+- Made Dave's two recovery hooks register independently and retry quietly when their Blueprint functions load late.
+- Kept firearm progression, Dave interaction, rerolls and `data.db` v2 unchanged.
+
+#### v0.18.4-dev11a — Architecture checkpoint
+
+- Derived from the runtime-tested Dev10 baseline.
+- No intentional firearm gameplay or balance changes.
+- Split F8 UI, compatibility, localisation, and Dave into responsibility-based subfolders.
+- Kept firearm runtime in `main.lua` for this checkpoint to minimise regression risk.
+- Preserved `data.db` v2 compatibility and Dave reroll behaviour.
+- Prepared the source tree for the next firearm/melee/localisation modularisation pass.
+
+#### v0.18.4-dev10 — Integrated stability checkpoint
+
+- Combined Dave's lifetime and recovery safeguards with fresh stat-entry reacquisition, player Jig resolution at mutation time and deferred native level-up notification.
+- Kept firearm balance and the existing `data.db` format. Added the initial English/Russian localisation dictionary without routing the UI through it yet.
+
+## Earlier releases and research
 
 ### v0.18.4-dev7
 

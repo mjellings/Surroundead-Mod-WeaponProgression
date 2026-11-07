@@ -1,10 +1,10 @@
 -- ============================================================================
--- WeaponProgression - Dave development spawn locations
+-- WeaponProgression - Dave spawn locations
 --
--- DEVELOPMENT FILE
+-- v0.18.4: the configured Safe Zone location is used by default.
 --
 -- TestLocation:
---   Set this to the location number you want Dave to use during testing.
+--   Set this to the location number where Dave should spawn.
 --   Reload the WeaponProgression Lua scripts, then press F6 to respawn Dave.
 --
 -- ZOffset:
@@ -15,14 +15,13 @@
 --   Use the RAW F9 coordinates from NPCLocationResearch here.
 --   Do NOT manually subtract 80 from Z; gunsmith.lua applies ZOffset for you.
 --
--- For the public 0.19 release we can fold/obscure these coordinates and choose
--- a spawn randomly so this file does not become a convenient treasure map.
+-- Randomised locations are future work; this release uses TestLocation.
 -- ============================================================================
 
 return {
     ZOffset = -80.0,
 
-    -- Change this while testing:
+    -- Configured spawn:
     -- 1 = Safe Zone
     -- 2 = Fishing Lodge
     TestLocation = 1,

@@ -4,11 +4,9 @@ A UE4SS Lua mod for **SurrounDead** that gives individual weapons their own pers
 
 Instead of every weapon of the same type being identical, WeaponProgression tracks each physical weapon separately. Use a weapon in combat, earn XP with it, level it up, and receive permanent stat improvements that stay associated with that specific weapon.
 
-> **Current status:** Active development / testing  
-> **Current stable release:** v0.18.3  
-> **In development:** v0.18.4-dev7 (integrated Dave gunsmith / spawn research)  
-> **Game:** SurrounDead  
-> **Framework:** UE4SS
+**Version:** v0.18.4-rc2 · **Game:** SurrounDead · **Framework:** UE4SS
+
+This build addresses a reported crash after firearm level-ups by moving delayed Unreal object work onto the game thread. It has passed static checks but needs in-game verification before replacing the public download. Dave's gunsmith and English, Russian and French UI text remain included; existing `data.db` v2 files stay compatible.
 
 ---
 
@@ -84,25 +82,11 @@ The normal inventory tooltip still shows the effective progression bonus beside 
 
 Press **F8** while holding a tracked firearm to open the native status card. It auto-closes after a few seconds and resets that timer if you switch weapons.
 
-### Dave's Gunsmith (Development)
+### Dave's Gunsmith
 
-The current development branch includes an integrated gunsmith NPC named **Dave**.
+Find **Dave** at the Safe Zone and press **F** to open his gunsmith screen. He can reroll a tracked firearm at **Level 5 or above** if it has ordinary progression upgrades. Rerolling redistributes those ordinary upgrades while preserving the weapon's identity, level, XP, kills and mastery bonuses. Rerolls are free in this version.
 
-Dave is spawned from SurrounDead's native QuestGiver actor and uses the game's normal interaction prompt. The gunsmith feature is now part of WeaponProgression itself rather than a separate research mod.
-
-Current development behaviour:
-
-- Native `[F] Dave` interaction
-- Custom gunsmith UI
-- Reads the currently held physical weapon directly from WeaponProgression's in-memory state
-- Level 5+ requirement for reroll eligibility
-- Free reroll testing while the feature is being developed
-- Rerolls redistribute the weapon's ordinary random progression upgrades
-- Level, XP, kills, weapon identity and mastery progression are preserved
-- The UI closes when the player moves away from Dave
-- Spawn-location research currently uses named development points in `Scripts/dave_locations.lua`
-
-The temporary standalone `NPCRerollResearch` mod is no longer required when testing the integrated development build.
+Dave uses a native QuestGiver interaction prompt. His screen closes when you walk away. His location is currently fixed by `Scripts/gunsmith/locations.lua`; random spawns and a reroll cost are future work. The development controls F5 (lower and respawn), F6 (respawn) and F7 (remove Dave) are still enabled in this build. The standalone `NPCRerollResearch` mod is no longer needed.
 
 ### Rolled Weapon Stats Are Preserved
 
@@ -146,9 +130,7 @@ Notifications therefore appear as part of the normal game UI rather than using a
 
 ## Installation
 
-WeaponProgression requires **UE4SS**.
-
-Place the `WeaponProgression` folder inside:
+WeaponProgression requires **UE4SS**. Place the complete `WeaponProgression` folder inside:
 
 ```text
 SurrounDead\Binaries\Win64\ue4ss\Mods\
@@ -162,22 +144,28 @@ ue4ss/
     └── WeaponProgression/
         ├── enabled.txt
         ├── config.ini
+        ├── README.md
+        ├── CHANGELOG.md
         └── Scripts/
             ├── main.lua
-            ├── ui.lua
-            ├── compatibility.lua
-            ├── gunsmith.lua
-            ├── gunsmith_ui.lua
-            └── dave_locations.lua   # development branch only
+            ├── core/
+            ├── firearms/
+            ├── ui/status.lua
+            ├── compatibility/compatibility.lua
+            └── gunsmith/
 ```
 
-WeaponProgression will create its progression database automatically when required.
+If you already use the mod, keep your `data.db`, `data.db.bak` and any custom `config.ini` values when replacing the files. The ZIP contains no personal database. Add `[Localization] Language=en` to an older config if you want to choose another language. WeaponProgression creates `data.db` automatically for a new installation.
 
 ---
 
 ## Configuration
 
 Progression behaviour can be customised through `config.ini`.
+
+### Language
+
+In `[Localization]`, set `Language=en` (English, default), `Language=ru` (Russian), or `Language=fr` (French), then restart the game or reload the mod. The setting changes WeaponProgression's F8 card, Dave's screen, native level-up messages and milestone descriptions. Game-provided weapon names keep the game's language. Custom mastery rank names in `config.ini` display exactly as written; built-in ranks are translated for display. Unknown language codes fall back to English. Language selection does not change `data.db`.
 
 ### Stat upgrades
 
@@ -194,6 +182,8 @@ Default per-level random upgrade values:
 ### Caps
 
 `[Caps]` sets the maximum total progression bonus above the captured original base. Caps apply to random level-up rewards and milestone bonuses combined.
+
+Level-up rewards and Dave's rerolls only pick stats that still have room below their cap. Once every stat on a weapon is capped, further level-ups still raise its level and mastery rank but award no ordinary stat upgrade. With the default settings this happens at around level 54.
 
 Default caps:
 
@@ -233,7 +223,7 @@ Supported bonus types:
 
 Set `Enabled=false` to disable milestones entirely while leaving the rest of progression unchanged.
 
-These values are subject to balancing while the mod remains in development.
+These values can be customised to suit your game.
 
 ### Tooltip compatibility
 
@@ -259,7 +249,9 @@ WeaponProgression stores per-weapon progression in:
 data.db
 ```
 
-This file is specific to your game and is deliberately excluded from this repository.
+This file is specific to your game and is deliberately excluded from the download. Back it up before updating the mod.
+
+WeaponProgression keeps the previous version as `data.db.bak` on every save. If `data.db` is found empty or unreadable at startup, the mod loads `data.db.bak` instead and logs `DATABASE RECOVERY`. It also refuses to save a database with fewer weapons than it loaded, so a damaged file cannot overwrite the backup.
 
 ### Resetting progression
 
@@ -277,69 +269,22 @@ For ordinary Lua/mod development, UE4SS's **Reload All Mods** functionality can 
 
 ## Current Limitations
 
-WeaponProgression is still under active development.
-
-Known limitations currently include:
+Known limitations include:
 
 - **Melee weapons are not supported.**
-- Progression currently focuses on firearms.
 - Some runtime weapon discovery operations still need performance optimisation.
 - Compatibility across all SurrounDead weapons has not yet been exhaustively tested.
 - Extra custom progression rows in the inventory tooltip are disabled by default for compatibility.
-- Dave's gunsmith is still in development; spawn locations and reroll cost/balancing are not final.
-- The persistence format may change during development.
-- Multiplayer behaviour has not yet been considered stable or supported.
+- Dave spawns at a fixed location and rerolls are free in this version.
+- Multiplayer behaviour is not yet considered stable or supported.
 
-Back up your saves when testing development versions.
-
----
-
-## Development Status
-
-### v0.18.3 — Current Stable Release
-
-v0.18.3 is the current public compatibility release.
-
-It retains the progression, persistence, mastery and F8 status-card systems while hardening the inventory tooltip path for a wider range of UE4SS builds. The normal tooltip still displays progression bonuses beside supported weapon stats, but the additional custom Level / XP / Kills / Rank rows are disabled by default.
-
-### v0.18.4-dev7 — In Development
-
-Current development work integrates **Dave**, a native-interaction gunsmith NPC, directly into WeaponProgression.
-
-The previous research implementation communicated with WeaponProgression through temporary files. The integrated version now reads held-weapon state and performs rerolls directly in memory.
-
-Current development work also includes:
-
-- Native `[F] Dave` prompt
-- Custom gunsmith UI
-- Level 5+ reroll eligibility
-- Direct in-memory rerolls
-- Named development spawn locations
-- QuestGiver ground-offset research
-- F5 / F6 / F7 spawn-development controls
-
-The eventual v0.19 release is expected to use a verified baked list of possible Dave locations and randomise his spawn rather than expose the development location list directly.
+Back up your progression data and saves before updating.
 
 ---
 
-## Planned Work
+## What's next
 
-Areas currently being investigated include:
-
-- Finalise and verify multiple Dave spawn locations
-- Randomise Dave's spawn from a baked production location list
-- Add a proper reroll cost/balancing model
-- Continue gunsmith UI polish and NPC behaviour research
-- Runtime performance improvements and safer weapon caching
-- Melee weapon support
-- Additional weapon/stat types
-- Milestone balancing and additional bonus types
-- More notification configuration
-- Database migrations and backups
-- Broader weapon compatibility testing
-- Reduced development/debug logging
-
-Longer-term progression systems may also include greater player choice over weapon upgrades.
+The next development work includes melee progression, broader weapon compatibility testing, more Dave spawn locations and reroll balancing, plus runtime performance improvements. See [CHANGELOG.md](CHANGELOG.md) for the complete development history.
 
 ---
 

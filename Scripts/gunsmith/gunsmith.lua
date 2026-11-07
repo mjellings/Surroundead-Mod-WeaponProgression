@@ -1,5 +1,5 @@
 -- ============================================================================
--- WeaponProgression Integrated Gunsmith (Dave) - v0.18.4-dev9
+-- WeaponProgression integrated gunsmith (Dave)
 --
 -- Uses direct in-memory callbacks supplied by WeaponProgression/main.lua.
 -- No active_weapon.api or reroll.request files.
@@ -29,21 +29,21 @@ local function load_location_config()
         error("Could not resolve WeaponProgression Scripts directory")
     end
 
-    local path = dir .. "dave_locations.lua"
+    local path = dir .. "locations.lua"
     local chunk, loadErr = loadfile(path)
     if not chunk then
-        error("Could not load dave_locations.lua: " .. tostring(loadErr))
+        error("Could not load gunsmith/locations.lua: " .. tostring(loadErr))
     end
 
     local ok, cfg = pcall(chunk)
     if not ok then
-        error("dave_locations.lua execution failed: " .. tostring(cfg))
+        error("gunsmith/locations.lua execution failed: " .. tostring(cfg))
     end
     if type(cfg) ~= "table" then
-        error("dave_locations.lua must return a table")
+        error("gunsmith/locations.lua must return a table")
     end
     if type(cfg.Locations) ~= "table" or #cfg.Locations == 0 then
-        error("dave_locations.lua has no Locations")
+        error("gunsmith/locations.lua has no Locations")
     end
 
     cfg.ZOffset = tonumber(cfg.ZOffset) or -80.0
@@ -73,6 +73,9 @@ local NO_FIREARM_CLOSE_MS = 3000
 
 local api = nil
 local ui = nil
+local function tr(key)
+    return api and api.Translate and api.Translate(key) or key
+end
 
 -- IMPORTANT:
 -- Do not keep Dave's UObject wrapper around long-term. UE4SS wrappers can outlive
@@ -85,6 +88,10 @@ local spawnedObjectName = nil
 
 local hookRegistered = false
 local recoveryHooksRegistered = false
+local recoveryFirearmHookRegistered = false
+local recoveryDeathHookRegistered = false
+local recoveryHookRetryScheduled = false
+local recoveryHookPendingLogged = false
 local recoveryCheckArmed = true
 local spawnGeneration = 0
 local proximityGeneration = 0
@@ -274,7 +281,7 @@ local function load_ui()
         return false
     end
 
-    local path = dir .. "gunsmith_ui.lua"
+    local path = dir .. "ui.lua"
     local okLoad, chunk = pcall(loadfile, path)
     if not okLoad or chunk == nil then
         log("UI LOAD FAILED | " .. tostring(chunk))
@@ -291,7 +298,8 @@ local function load_ui()
     if type(ui.Configure) == "function" then
         pcall(function()
             ui.Configure({
-                title = "DAVE'S GUNSMITH",
+                title = tr("dave_title"),
+                Translate = tr,
                 x = 92,
                 y = 210,
                 width = 620,
@@ -351,24 +359,24 @@ local function build_ui_state()
 
     if held.state == "none" then
         return {
-            weapon = "DAVE'S GUNSMITH",
-            status = "Alright?\nI can't help much if you aren't holding a firearm.",
+            weapon = tr("dave_title"),
+            status = tr("dave_no_weapon"),
             show_button = false,
         }, held
     end
 
     if held.state == "unresolved" then
         return {
-            weapon = held.weapon or "UNKNOWN WEAPON",
-            status = "I can see it, but I can't identify this weapon yet.\nTry switching weapons and give me another look.",
+            weapon = held.weapon or tr("unknown_weapon_upper"),
+            status = tr("dave_unresolved"),
             show_button = false,
         }, held
     end
 
     if held.state == "untracked" then
         return {
-            weapon = held.weapon or "UNTRACKED WEAPON",
-            status = "I don't know this one yet.\nUse it a little and come back.",
+            weapon = held.weapon or tr("untracked_weapon"),
+            status = tr("dave_untracked"),
             show_button = false,
         }, held
     end
@@ -382,10 +390,10 @@ local function build_ui_state()
             level = level,
             rank = held.rank,
             stats = held.stats,
-            message = "Not enough history on this one yet.\nCome back when it reaches Level 5.",
+            message = tr("dave_low_level"),
             show_button = true,
             button_enabled = false,
-            button_text = "REROLL",
+            button_text = tr("reroll"),
         }, held
     end
 
@@ -394,13 +402,10 @@ local function build_ui_state()
         level = level,
         rank = held.rank,
         stats = held.stats,
-        message = string.format(
-            "Redistributes %d ordinary progression bonuses.\nLevel, XP, kills and mastery are preserved.",
-            rolls
-        ),
+        message = string.format(tr("reroll_explanation_count"), rolls),
         show_button = true,
         button_enabled = (rolls > 0),
-        button_text = "REROLL",
+        button_text = tr("reroll"),
     }, held
 end
 
@@ -419,32 +424,32 @@ local function request_reroll()
     local state, held = build_ui_state()
 
     if held.state ~= "tracked" or held.uid == nil then
-        refresh_ui("I can't reroll this weapon right now.", false)
+        refresh_ui(tr("reroll_unavailable"), false)
         return
     end
 
     if (held.level or 1) < 5 then
-        refresh_ui("This weapon must reach Level 5\nbefore I can reroll it.", false)
+        refresh_ui(tr("reroll_level_required"), false)
         return
     end
 
     if (held.ordinary_rolls or 0) <= 0 then
-        refresh_ui("This weapon has no ordinary progression bonuses\nto reroll.", false)
+        refresh_ui(tr("reroll_no_bonuses"), false)
         return
     end
 
-    state.message = "Rerolling..."
+    state.message = tr("rerolling")
     state.button_enabled = false
     pcall(function() ui.SetState(state) end)
 
     local ok, message = api.Reroll(held.uid)
 
     if ok then
-        refresh_ui("Reroll successful.\nNew progression stats are shown above.", true)
+        refresh_ui(tr("reroll_success"), true)
         log("REROLL | SUCCESS | weapon=" .. tostring(held.weapon) ..
             " | uid=" .. tostring(held.uid))
     else
-        refresh_ui(message or "Reroll failed.", true)
+        refresh_ui(message or tr("reroll_failed"), true)
         log("REROLL | FAILED | " .. tostring(message))
     end
 end
@@ -792,44 +797,68 @@ end
 local function register_recovery_hooks()
     if recoveryHooksRegistered then return true end
 
-    local registered = 0
-
     local firearmPath =
         "/Game/Inventory/Items/Pickups/Weapons/Firearms/BP_FirearmPickup.BP_FirearmPickup_C:SERVER_DamageEvent"
-
-    local okFire, fireA, fireB = pcall(function()
-        return RegisterHook(firearmPath, function(...)
-            runtime_recovery_check("firearm damage")
-        end)
-    end)
-
-    if okFire then
-        registered = registered + 1
-        log("RECOVERY HOOK READY | firearm damage | ids=" ..
-            tostring(fireA) .. "," .. tostring(fireB))
-    else
-        log("RECOVERY HOOK FAILED | firearm damage | " .. tostring(fireA))
-    end
-
     local deathPath =
         "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C:Death"
 
-    local okDeath, deathA, deathB = pcall(function()
-        return RegisterHook(deathPath, function(...)
-            runtime_recovery_check("zombie death")
+    -- Blueprint UFunctions are not guaranteed to exist when this module first
+    -- initialises. Register each hook independently and quietly retry anything
+    -- that is not loaded yet. Never retry a hook that has already succeeded.
+    if not recoveryFirearmHookRegistered then
+        local okFire, fireA, fireB = pcall(function()
+            return RegisterHook(firearmPath, function(...)
+                runtime_recovery_check("firearm damage")
+            end)
         end)
-    end)
 
-    if okDeath then
-        registered = registered + 1
-        log("RECOVERY HOOK READY | zombie death | ids=" ..
-            tostring(deathA) .. "," .. tostring(deathB))
-    else
-        log("RECOVERY HOOK FAILED | zombie death | " .. tostring(deathA))
+        if okFire then
+            recoveryFirearmHookRegistered = true
+            log("RECOVERY HOOK READY | firearm damage | ids=" ..
+                tostring(fireA) .. "," .. tostring(fireB))
+        end
     end
 
-    recoveryHooksRegistered = registered > 0
-    return recoveryHooksRegistered
+    if not recoveryDeathHookRegistered then
+        local okDeath, deathA, deathB = pcall(function()
+            return RegisterHook(deathPath, function(...)
+                runtime_recovery_check("zombie death")
+            end)
+        end)
+
+        if okDeath then
+            recoveryDeathHookRegistered = true
+            log("RECOVERY HOOK READY | zombie death | ids=" ..
+                tostring(deathA) .. "," .. tostring(deathB))
+        end
+    end
+
+    recoveryHooksRegistered = recoveryFirearmHookRegistered and recoveryDeathHookRegistered
+
+    if recoveryHooksRegistered then
+        recoveryHookRetryScheduled = false
+        if recoveryHookPendingLogged then
+            log("RECOVERY HOOKS READY | deferred registration complete")
+        end
+        return true
+    end
+
+    if not recoveryHookPendingLogged then
+        recoveryHookPendingLogged = true
+        log("RECOVERY HOOKS PENDING | Blueprint functions not loaded yet; retrying quietly")
+    end
+
+    if not recoveryHookRetryScheduled then
+        recoveryHookRetryScheduled = true
+        ExecuteWithDelay(5000, function()
+            ExecuteInGameThread(function()
+                recoveryHookRetryScheduled = false
+                register_recovery_hooks()
+            end)
+        end)
+    end
+
+    return false
 end
 
 local function register_controls()
